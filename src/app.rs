@@ -353,6 +353,9 @@ impl App {
             self.status = "Wait for the current request to finish".to_string();
             return;
         }
+        if self.complete_selected_command() {
+            return;
+        }
         let prompt = self.input.trim().to_string();
         if prompt.is_empty() {
             return;
@@ -378,23 +381,12 @@ impl App {
             return;
         };
 
-        let local_answer = self.memory_recall_answer(&prompt);
         self.push_transcript("user", prompt.clone());
         self.messages.push(ChatMessage {
             role: "user".to_string(),
             content: prompt,
         });
         self.save_conversation();
-        if let Some(answer) = local_answer {
-            self.push_transcript("assistant", answer.clone());
-            self.messages.push(ChatMessage {
-                role: "assistant".to_string(),
-                content: answer,
-            });
-            self.save_conversation();
-            self.status = "Answered from conversation memory".to_string();
-            return;
-        }
         self.start_chat(model);
     }
 
@@ -715,28 +707,6 @@ impl App {
         )
     }
 
-    fn memory_recall_answer(&self, prompt: &str) -> Option<String> {
-        let lower = prompt.to_lowercase();
-        let asks_recent_user = [
-            "what did i just say",
-            "what did i just ask",
-            "what was my last message",
-            "what did i say",
-            "what did i ask",
-        ]
-        .iter()
-        .any(|needle| lower.contains(needle));
-        if !asks_recent_user {
-            return None;
-        }
-
-        self.messages
-            .iter()
-            .rev()
-            .find(|message| message.role == "user" && !message.content.starts_with("Tool result"))
-            .map(|message| format!("You just said: {}", message.content))
-    }
-
     fn reload_agents(&mut self) {
         self.agents_md = agents::load(&self.cwd);
         if let Some(system) = self.messages.first_mut() {
@@ -775,6 +745,29 @@ impl App {
         } else {
             suggestions
         }
+    }
+
+    fn complete_selected_command(&mut self) -> bool {
+        if !self.commands_active() {
+            return false;
+        }
+        let prefix = self
+            .input
+            .split_whitespace()
+            .next()
+            .unwrap_or(self.input.as_str());
+        if COMMANDS.iter().any(|command| command.name == prefix) {
+            return false;
+        }
+        let suggestions = self.command_suggestions();
+        let Some(command) = suggestions.get(self.selected_command_index()) else {
+            return false;
+        };
+        self.input = format!("{} ", command.name);
+        self.input_cursor = self.input.len();
+        self.command_cursor = 0;
+        self.status = format!("Completed {}", command.name);
+        true
     }
 
     fn clamp_command_cursor(&mut self) {
@@ -1019,16 +1012,22 @@ mod tests {
     }
 
     #[test]
-    fn answers_recent_memory_questions_locally() {
+    fn enter_completes_partial_command() {
         let mut app = test_app();
-        app.messages.push(ChatMessage {
-            role: "user".to_string(),
-            content: "hello".to_string(),
-        });
+        app.input = "/mo".to_string();
+        app.input_cursor = app.input.len();
+        app.command_selection_down();
 
-        assert_eq!(
-            app.memory_recall_answer("what did i just say?"),
-            Some("You just said: hello".to_string())
-        );
+        assert!(app.complete_selected_command());
+        assert_eq!(app.input, "/models ");
+    }
+
+    #[test]
+    fn exact_command_does_not_autocomplete() {
+        let mut app = test_app();
+        app.input = "/models".to_string();
+        app.input_cursor = app.input.len();
+
+        assert!(!app.complete_selected_command());
     }
 }

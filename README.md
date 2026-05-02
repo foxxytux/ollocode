@@ -17,6 +17,7 @@ Model output wrapped in `<think>...</think>` is shown in the transcript as `thin
 ## Keys
 
 - `Enter`: send prompt
+- `Enter` while typing a partial `/` command: autocomplete the selected command
 - `Ctrl+J` / `Ctrl+K`: select next/previous model
 - `Ctrl+M`: refresh models from Ollama
 - `Up` / `Down`: browse prompt history
