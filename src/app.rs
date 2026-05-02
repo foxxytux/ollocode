@@ -75,7 +75,10 @@ impl App {
         let client = self.client.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let result = client.list_models().await.map_err(|error| format!("{error:#}"));
+            let result = client
+                .list_models()
+                .await
+                .map_err(|error| format!("{error:#}"));
             let _ = tx.send(AppEvent::ModelsLoaded(result));
         });
     }

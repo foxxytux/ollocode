@@ -30,8 +30,8 @@ impl Config {
         }
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let mut config: Self = toml::from_str(&raw)
-            .with_context(|| format!("failed to parse {}", path.display()))?;
+        let mut config: Self =
+            toml::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))?;
         if let Ok(host) = std::env::var("OLLAMA_HOST") {
             config.ollama_host = host;
         }
