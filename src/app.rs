@@ -46,6 +46,7 @@ pub struct App {
     pub rx: mpsc::UnboundedReceiver<AppEvent>,
     messages: Vec<ChatMessage>,
     pending_assistant: String,
+    response_start: Option<usize>,
     agents_md: Option<String>,
 }
 
@@ -151,6 +152,7 @@ impl App {
             rx,
             messages,
             pending_assistant: String::new(),
+            response_start: None,
             agents_md,
         };
         app.restore_transcript_from_messages();
@@ -376,12 +378,23 @@ impl App {
             return;
         };
 
+        let local_answer = self.memory_recall_answer(&prompt);
         self.push_transcript("user", prompt.clone());
         self.messages.push(ChatMessage {
             role: "user".to_string(),
             content: prompt,
         });
         self.save_conversation();
+        if let Some(answer) = local_answer {
+            self.push_transcript("assistant", answer.clone());
+            self.messages.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: answer,
+            });
+            self.save_conversation();
+            self.status = "Answered from conversation memory".to_string();
+            return;
+        }
         self.start_chat(model);
     }
 
@@ -389,6 +402,7 @@ impl App {
         self.busy = true;
         self.transcript_scroll = 0;
         self.pending_assistant.clear();
+        self.response_start = Some(self.transcript.len());
         self.push_transcript("assistant", String::new());
         self.status = format!("Streaming from {model}");
         let client = self.client.clone();
@@ -493,6 +507,7 @@ impl App {
             }
             AppEvent::AssistantDone(Err(error)) => {
                 self.busy = false;
+                self.response_start = None;
                 self.status = format!("Chat error: {error}");
                 if let Some(item) = self.transcript.last_mut() {
                     if item.role == "assistant" && item.content.is_empty() {
@@ -536,6 +551,7 @@ impl App {
     fn replace_latest_assistant_with_parts(&mut self, content: &str) {
         let parts = split_thinking(content);
         if parts.len() == 1 && parts[0].0 == "assistant" {
+            self.response_start = None;
             if let Some(item) = self.transcript.last_mut() {
                 if item.role == "assistant" {
                     item.content = parts[0].1.clone();
@@ -544,7 +560,9 @@ impl App {
             return;
         }
 
-        if matches!(self.transcript.last(), Some(item) if item.role == "assistant") {
+        if let Some(start) = self.response_start.take() {
+            self.transcript.truncate(start);
+        } else if matches!(self.transcript.last(), Some(item) if item.role == "assistant") {
             self.transcript.pop();
         }
         for (role, content) in parts {
@@ -695,6 +713,28 @@ impl App {
                 .filter(|message| message.role != "system")
                 .count()
         )
+    }
+
+    fn memory_recall_answer(&self, prompt: &str) -> Option<String> {
+        let lower = prompt.to_lowercase();
+        let asks_recent_user = [
+            "what did i just say",
+            "what did i just ask",
+            "what was my last message",
+            "what did i say",
+            "what did i ask",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle));
+        if !asks_recent_user {
+            return None;
+        }
+
+        self.messages
+            .iter()
+            .rev()
+            .find(|message| message.role == "user" && !message.content.starts_with("Tool result"))
+            .map(|message| format!("You just said: {}", message.content))
     }
 
     fn reload_agents(&mut self) {
@@ -902,6 +942,7 @@ mod tests {
             rx,
             messages: vec![system_prompt(None)],
             pending_assistant: String::new(),
+            response_start: None,
             agents_md: None,
         }
     }
@@ -974,6 +1015,20 @@ mod tests {
                 ("thinking".to_string(), "checking files".to_string()),
                 ("assistant".to_string(), "Done.".to_string())
             ]
+        );
+    }
+
+    #[test]
+    fn answers_recent_memory_questions_locally() {
+        let mut app = test_app();
+        app.messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: "hello".to_string(),
+        });
+
+        assert_eq!(
+            app.memory_recall_answer("what did i just say?"),
+            Some("You just said: hello".to_string())
         );
     }
 }

@@ -115,6 +115,7 @@ impl OllamaClient {
         let mut stream = response.bytes_stream();
         let mut pending = String::new();
         let mut full = String::new();
+        let mut thinking_open = false;
 
         while let Some(chunk) = stream.next().await {
             let bytes = chunk.context("failed to read Ollama stream")?;
@@ -135,19 +136,32 @@ impl OllamaClient {
                 if let Some(message) = chunk.message {
                     if let Some(thinking) = message.thinking.filter(|value| !value.is_empty()) {
                         on_delta(ChatDelta::Thinking(thinking.clone()));
-                        full.push_str("<think>");
+                        if !thinking_open {
+                            full.push_str("<think>");
+                            thinking_open = true;
+                        }
                         full.push_str(&thinking);
-                        full.push_str("</think>");
                     }
                     if let Some(content) = message.content.filter(|value| !value.is_empty()) {
+                        if thinking_open {
+                            full.push_str("</think>");
+                            thinking_open = false;
+                        }
                         on_delta(ChatDelta::Content(content.clone()));
                         full.push_str(&content);
                     }
                 } else if let Some(delta) = chunk.response.filter(|value| !value.is_empty()) {
+                    if thinking_open {
+                        full.push_str("</think>");
+                        thinking_open = false;
+                    }
                     on_delta(ChatDelta::Content(delta.clone()));
                     full.push_str(&delta);
                 }
                 if chunk.done {
+                    if thinking_open {
+                        full.push_str("</think>");
+                    }
                     return Ok(full);
                 }
             }
@@ -162,18 +176,32 @@ impl OllamaClient {
             if let Some(message) = chunk.message {
                 if let Some(thinking) = message.thinking.filter(|value| !value.is_empty()) {
                     on_delta(ChatDelta::Thinking(thinking.clone()));
-                    full.push_str("<think>");
+                    if !thinking_open {
+                        full.push_str("<think>");
+                        thinking_open = true;
+                    }
                     full.push_str(&thinking);
-                    full.push_str("</think>");
                 }
                 if let Some(content) = message.content.filter(|value| !value.is_empty()) {
+                    if thinking_open {
+                        full.push_str("</think>");
+                        thinking_open = false;
+                    }
                     on_delta(ChatDelta::Content(content.clone()));
                     full.push_str(&content);
                 }
             } else if let Some(delta) = chunk.response.filter(|value| !value.is_empty()) {
+                if thinking_open {
+                    full.push_str("</think>");
+                    thinking_open = false;
+                }
                 on_delta(ChatDelta::Content(delta.clone()));
                 full.push_str(&delta);
             }
+        }
+
+        if thinking_open {
+            full.push_str("</think>");
         }
 
         Ok(full)
