@@ -232,6 +232,7 @@ fn transcript_lines(app: &App) -> Vec<Line<'static>> {
         let style = match item.role.as_str() {
             "user" => Style::default().fg(Color::Green),
             "assistant" => Style::default().fg(Color::White),
+            "thinking" => Style::default().fg(Color::Magenta),
             "tool" => Style::default().fg(Color::Yellow),
             _ => Style::default(),
         };

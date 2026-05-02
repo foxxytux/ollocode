@@ -449,6 +449,7 @@ impl App {
                     content: content.clone(),
                 });
                 self.save_conversation();
+                self.replace_latest_assistant_with_parts(&content);
                 self.status = "Assistant response complete".to_string();
 
                 match extract_tool_call(&content) {
@@ -509,6 +510,27 @@ impl App {
             content,
             timestamp: Local::now(),
         });
+    }
+
+    fn replace_latest_assistant_with_parts(&mut self, content: &str) {
+        let parts = split_thinking(content);
+        if parts.len() == 1 && parts[0].0 == "assistant" {
+            if let Some(item) = self.transcript.last_mut() {
+                if item.role == "assistant" {
+                    item.content = parts[0].1.clone();
+                }
+            }
+            return;
+        }
+
+        if matches!(self.transcript.last(), Some(item) if item.role == "assistant") {
+            self.transcript.pop();
+        }
+        for (role, content) in parts {
+            if !content.trim().is_empty() {
+                self.push_transcript(&role, content);
+            }
+        }
     }
 
     fn handle_command(&mut self, command: &str) {
@@ -708,7 +730,7 @@ impl App {
             .messages
             .iter()
             .filter(|message| message.role != "system")
-            .map(|message| {
+            .flat_map(|message| {
                 let role = if message
                     .content
                     .starts_with("Tool result for your previous tool call:")
@@ -717,7 +739,11 @@ impl App {
                 } else {
                     message.role.clone()
                 };
-                (role, message.content.clone())
+                if role == "assistant" {
+                    split_thinking(&message.content)
+                } else {
+                    vec![(role, message.content.clone())]
+                }
             })
             .collect();
         for (role, content) in restored {
@@ -768,6 +794,46 @@ impl App {
 
 fn approximate_tokens(text: &str) -> usize {
     (text.chars().count() / 4).max(1)
+}
+
+fn split_thinking(content: &str) -> Vec<(String, String)> {
+    let mut parts = Vec::new();
+    let mut rest = content;
+
+    loop {
+        let Some(start) = rest.find("<think>") else {
+            if !rest.trim().is_empty() {
+                parts.push(("assistant".to_string(), rest.trim().to_string()));
+            }
+            break;
+        };
+
+        let before = &rest[..start];
+        if !before.trim().is_empty() {
+            parts.push(("assistant".to_string(), before.trim().to_string()));
+        }
+
+        let thinking_start = start + "<think>".len();
+        if let Some(end) = rest[thinking_start..].find("</think>") {
+            let thinking_end = thinking_start + end;
+            let thinking = &rest[thinking_start..thinking_end];
+            if !thinking.trim().is_empty() {
+                parts.push(("thinking".to_string(), thinking.trim().to_string()));
+            }
+            rest = &rest[thinking_end + "</think>".len()..];
+        } else {
+            let thinking = &rest[thinking_start..];
+            if !thinking.trim().is_empty() {
+                parts.push(("thinking".to_string(), thinking.trim().to_string()));
+            }
+            break;
+        }
+    }
+
+    if parts.is_empty() {
+        parts.push(("assistant".to_string(), String::new()));
+    }
+    parts
 }
 
 fn previous_boundary(text: &str, cursor: usize) -> Option<usize> {
@@ -876,5 +942,17 @@ mod tests {
 
         assert!(app.context_percent().is_some());
         assert!(app.context_label().starts_with("ctx "));
+    }
+
+    #[test]
+    fn splits_thinking_blocks_for_display() {
+        let parts = split_thinking("<think>checking files</think>\nDone.");
+        assert_eq!(
+            parts,
+            vec![
+                ("thinking".to_string(), "checking files".to_string()),
+                ("assistant".to_string(), "Done.".to_string())
+            ]
+        );
     }
 }

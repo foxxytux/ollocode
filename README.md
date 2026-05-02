@@ -12,6 +12,7 @@ cargo run
 
 The app reads models from Ollama's local API and lets you switch models in the TUI.
 Conversation context is restored per workspace, and the header shows an approximate context-window percentage for the selected model.
+Model output wrapped in `<think>...</think>` is shown in the transcript as `thinking`.
 
 ## Keys
 
