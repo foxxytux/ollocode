@@ -15,12 +15,14 @@ pub struct UiAreas {
 }
 
 pub fn draw(frame: &mut Frame<'_>, app: &App) {
-    let areas = layout_areas(frame.area());
+    let areas = layout_areas(frame.area(), app.commands_active());
 
     draw_header(frame, app, areas.header);
     draw_transcript(frame, app, areas.transcript);
     draw_models(frame, app, areas.models);
-    draw_suggestions(frame, app, areas.suggestions);
+    if let Some(suggestions) = areas.suggestions {
+        draw_suggestions(frame, app, suggestions);
+    }
     draw_input(frame, app, areas.input);
     draw_status(frame, app, areas.status);
 }
@@ -30,13 +32,13 @@ struct AllAreas {
     header: Rect,
     transcript: Rect,
     models: Rect,
-    suggestions: Rect,
+    suggestions: Option<Rect>,
     input: Rect,
     status: Rect,
 }
 
-pub fn public_areas(area: Rect) -> UiAreas {
-    let areas = layout_areas(area);
+pub fn public_areas(area: Rect, show_commands: bool) -> UiAreas {
+    let areas = layout_areas(area, show_commands);
     UiAreas {
         transcript: areas.transcript,
         models: areas.models,
@@ -44,16 +46,26 @@ pub fn public_areas(area: Rect) -> UiAreas {
     }
 }
 
-fn layout_areas(area: Rect) -> AllAreas {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
+fn layout_areas(area: Rect, show_commands: bool) -> AllAreas {
+    let constraints = if show_commands {
+        vec![
             Constraint::Length(3),
             Constraint::Min(8),
             Constraint::Length(6),
             Constraint::Length(4),
             Constraint::Length(1),
-        ])
+        ]
+    } else {
+        vec![
+            Constraint::Length(3),
+            Constraint::Min(8),
+            Constraint::Length(4),
+            Constraint::Length(1),
+        ]
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
         .split(area);
 
     let body = Layout::default()
@@ -61,13 +73,19 @@ fn layout_areas(area: Rect) -> AllAreas {
         .constraints([Constraint::Min(40), Constraint::Length(28)])
         .split(chunks[1]);
 
+    let (suggestions, input, status) = if show_commands {
+        (Some(chunks[2]), chunks[3], chunks[4])
+    } else {
+        (None, chunks[2], chunks[3])
+    };
+
     AllAreas {
         header: chunks[0],
         transcript: body[0],
         models: body[1],
-        suggestions: chunks[2],
-        input: chunks[3],
-        status: chunks[4],
+        suggestions,
+        input,
+        status,
     }
 }
 
@@ -137,28 +155,29 @@ fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn draw_suggestions(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let suggestions = app.command_suggestions();
-    let lines = if suggestions.is_empty() {
-        vec![Line::from(vec![
-            Span::styled("Type / for commands", Style::default().fg(Color::DarkGray)),
-            Span::raw("   "),
-            Span::styled(
-                "Paste works with bracketed paste",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ])]
-    } else {
-        suggestions
-            .iter()
-            .take(area.height.saturating_sub(2) as usize)
-            .map(|command| {
-                Line::from(vec![
-                    Span::styled(command.usage, Style::default().fg(Color::Cyan)),
-                    Span::raw("  "),
-                    Span::styled(command.description, Style::default().fg(Color::Gray)),
-                ])
-            })
-            .collect()
-    };
+    let selected = app.selected_command_index();
+    let lines = suggestions
+        .iter()
+        .enumerate()
+        .take(area.height.saturating_sub(2) as usize)
+        .map(|(index, command)| {
+            let is_selected = index == selected;
+            let marker = if is_selected { "> " } else { "  " };
+            let usage_style = if is_selected {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            Line::from(vec![
+                Span::styled(marker, usage_style),
+                Span::styled(command.usage, usage_style),
+                Span::raw("  "),
+                Span::styled(command.description, Style::default().fg(Color::Gray)),
+            ])
+        })
+        .collect::<Vec<_>>();
 
     frame.render_widget(
         Paragraph::new(lines).block(Block::default().title("Commands").borders(Borders::ALL)),

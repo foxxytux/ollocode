@@ -18,6 +18,7 @@ The app reads models from Ollama's local API and lets you switch models in the T
 - `Ctrl+J` / `Ctrl+K`: select next/previous model
 - `Ctrl+M`: refresh models from Ollama
 - `Up` / `Down`: browse prompt history
+- `Up` / `Down` while typing `/`: move through command suggestions
 - `Left` / `Right`, `Home` / `End`: edit the prompt
 - `PageUp` / `PageDown`: scroll transcript
 - Paste: bracketed terminal paste inserts text at the cursor.
@@ -44,7 +45,7 @@ The app reads models from Ollama's local API and lets you switch models in the T
 - Use the mouse wheel over the model pane to switch models.
 - Click inside the prompt to move the cursor.
 
-Command suggestions appear while typing `/` commands.
+Command suggestions appear only while typing `/` commands.
 
 ## Tool Calls
 

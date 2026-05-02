@@ -72,8 +72,20 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         (KeyModifiers::CONTROL, KeyCode::Char('k')) => app.select_previous_model(),
         (KeyModifiers::CONTROL, KeyCode::Char('a')) => app.input_home(),
         (KeyModifiers::CONTROL, KeyCode::Char('e')) => app.input_end(),
-        (_, KeyCode::Up) => app.history_previous(),
-        (_, KeyCode::Down) => app.history_next(),
+        (_, KeyCode::Up) => {
+            if app.commands_active() {
+                app.command_selection_up();
+            } else {
+                app.history_previous();
+            }
+        }
+        (_, KeyCode::Down) => {
+            if app.commands_active() {
+                app.command_selection_down();
+            } else {
+                app.history_next();
+            }
+        }
         (_, KeyCode::Left) => app.input_left(),
         (_, KeyCode::Right) => app.input_right(),
         (_, KeyCode::Home) => app.input_home(),
@@ -95,7 +107,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 
 fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Result<()> {
     let (width, height) = size()?;
-    let areas = tui::public_areas(Rect::new(0, 0, width, height));
+    let areas = tui::public_areas(Rect::new(0, 0, width, height), app.commands_active());
 
     match mouse.kind {
         MouseEventKind::ScrollUp => {

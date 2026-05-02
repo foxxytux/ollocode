@@ -34,6 +34,7 @@ pub struct App {
     pub selected_model: Option<String>,
     pub input: String,
     pub input_cursor: usize,
+    pub command_cursor: usize,
     pub history_cursor: Option<usize>,
     pub transcript: Vec<TranscriptItem>,
     pub transcript_scroll: usize,
@@ -125,6 +126,7 @@ impl App {
             models: Vec::new(),
             input: String::new(),
             input_cursor: 0,
+            command_cursor: 0,
             history_cursor: None,
             transcript: Vec::new(),
             transcript_scroll: 0,
@@ -203,12 +205,14 @@ impl App {
         self.history_cursor = None;
         self.input.insert(self.input_cursor, ch);
         self.input_cursor += ch.len_utf8();
+        self.clamp_command_cursor();
     }
 
     pub fn input_insert_str(&mut self, text: &str) {
         self.history_cursor = None;
         self.input.insert_str(self.input_cursor, text);
         self.input_cursor += text.len();
+        self.clamp_command_cursor();
     }
 
     pub fn input_backspace(&mut self) {
@@ -217,6 +221,7 @@ impl App {
             self.input.drain(previous..self.input_cursor);
             self.input_cursor = previous;
         }
+        self.clamp_command_cursor();
     }
 
     pub fn input_delete(&mut self) {
@@ -224,6 +229,7 @@ impl App {
         if let Some(next) = next_boundary(&self.input, self.input_cursor) {
             self.input.drain(self.input_cursor..next);
         }
+        self.clamp_command_cursor();
     }
 
     pub fn input_left(&mut self) {
@@ -273,6 +279,43 @@ impl App {
         self.input_cursor = self.input.len();
     }
 
+    pub fn commands_active(&self) -> bool {
+        self.input.starts_with('/')
+    }
+
+    pub fn command_selection_up(&mut self) {
+        if !self.commands_active() {
+            return;
+        }
+        let len = self.command_suggestions().len();
+        if len == 0 {
+            self.command_cursor = 0;
+        } else {
+            self.command_cursor = self.command_cursor.saturating_sub(1);
+        }
+    }
+
+    pub fn command_selection_down(&mut self) {
+        if !self.commands_active() {
+            return;
+        }
+        let len = self.command_suggestions().len();
+        if len == 0 {
+            self.command_cursor = 0;
+        } else {
+            self.command_cursor = (self.command_cursor + 1).min(len - 1);
+        }
+    }
+
+    pub fn selected_command_index(&self) -> usize {
+        let len = self.command_suggestions().len();
+        if len == 0 {
+            0
+        } else {
+            self.command_cursor.min(len - 1)
+        }
+    }
+
     pub fn submit_prompt(&mut self) {
         if self.busy {
             self.status = "Wait for the current request to finish".to_string();
@@ -285,6 +328,7 @@ impl App {
 
         self.input.clear();
         self.input_cursor = 0;
+        self.command_cursor = 0;
         self.history_cursor = None;
         self.config.prompt_history.push(prompt.clone());
         if self.config.prompt_history.len() > 100 {
@@ -602,6 +646,15 @@ impl App {
             suggestions
         }
     }
+
+    fn clamp_command_cursor(&mut self) {
+        let len = self.command_suggestions().len();
+        if len == 0 {
+            self.command_cursor = 0;
+        } else {
+            self.command_cursor = self.command_cursor.min(len - 1);
+        }
+    }
 }
 
 fn previous_boundary(text: &str, cursor: usize) -> Option<usize> {
@@ -638,6 +691,7 @@ mod tests {
             models: Vec::new(),
             input: String::new(),
             input_cursor: 0,
+            command_cursor: 0,
             history_cursor: None,
             transcript: Vec::new(),
             transcript_scroll: 0,
@@ -675,5 +729,20 @@ mod tests {
             .map(|command| command.name)
             .collect();
         assert_eq!(names, vec!["/model", "/models"]);
+    }
+
+    #[test]
+    fn arrows_scroll_command_selection() {
+        let mut app = test_app();
+        app.input = "/mo".to_string();
+        app.input_cursor = app.input.len();
+
+        assert_eq!(app.selected_command_index(), 0);
+        app.command_selection_down();
+        assert_eq!(app.selected_command_index(), 1);
+        app.command_selection_down();
+        assert_eq!(app.selected_command_index(), 1);
+        app.command_selection_up();
+        assert_eq!(app.selected_command_index(), 0);
     }
 }
