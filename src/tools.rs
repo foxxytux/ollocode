@@ -48,7 +48,7 @@ impl ToolRunner {
             ToolCall::ListFiles { path } => self.list_files(&path),
             ToolCall::ReadFile { path } => self.read_file(&path),
             ToolCall::WriteFile { path, content } => self.write_file(&path, &content),
-            ToolCall::ApplyPatch { patch } => self.apply_patch(&patch).await,
+            ToolCall::ApplyPatch { patch } => self.apply_patch(&patch),
             ToolCall::RunCommand { command } => self.run_command(&command).await,
         }
     }
@@ -56,7 +56,9 @@ impl ToolRunner {
     fn list_files(&self, path: &str) -> Result<String> {
         let path = self.workspace_path(path)?;
         let mut entries = Vec::new();
-        for entry in fs::read_dir(&path).with_context(|| format!("failed to read {}", path.display()))? {
+        for entry in
+            fs::read_dir(&path).with_context(|| format!("failed to read {}", path.display()))?
+        {
             let entry = entry?;
             let kind = if entry.file_type()?.is_dir() { "/" } else { "" };
             entries.push(format!("{}{}", entry.file_name().to_string_lossy(), kind));
@@ -77,34 +79,97 @@ impl ToolRunner {
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
         fs::write(&path, content).with_context(|| format!("failed to write {}", path.display()))?;
-        Ok(format!("wrote {}", path.strip_prefix(&self.root).unwrap_or(&path).display()))
+        Ok(format!(
+            "wrote {}",
+            path.strip_prefix(&self.root).unwrap_or(&path).display()
+        ))
     }
 
-    async fn apply_patch(&self, patch: &str) -> Result<String> {
+    fn apply_patch(&self, patch: &str) -> Result<String> {
         if !patch.contains("*** Begin Patch") || !patch.contains("*** End Patch") {
             bail!("patch must use apply_patch format");
         }
 
-        let mut child = Command::new("apply_patch")
-            .current_dir(&self.root)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("failed to spawn apply_patch")?;
+        let mut changed = Vec::new();
+        let lines: Vec<&str> = patch.lines().collect();
+        let mut index = 0;
 
-        if let Some(mut stdin) = child.stdin.take() {
-            use tokio::io::AsyncWriteExt;
-            stdin.write_all(patch.as_bytes()).await?;
+        while index < lines.len() {
+            let line = lines[index];
+            if let Some(path) = line.strip_prefix("*** Add File: ") {
+                index += 1;
+                let mut content = String::new();
+                while index < lines.len() && !lines[index].starts_with("*** ") {
+                    let add_line = lines[index]
+                        .strip_prefix('+')
+                        .ok_or_else(|| anyhow::anyhow!("add file lines must start with +"))?;
+                    content.push_str(add_line);
+                    content.push('\n');
+                    index += 1;
+                }
+                self.write_file(path, &content)?;
+                changed.push(format!("added {path}"));
+                continue;
+            }
+
+            if let Some(path) = line.strip_prefix("*** Delete File: ") {
+                let path_buf = self.workspace_path(path)?;
+                fs::remove_file(&path_buf)
+                    .with_context(|| format!("failed to delete {}", path_buf.display()))?;
+                changed.push(format!("deleted {path}"));
+                index += 1;
+                continue;
+            }
+
+            if let Some(path) = line.strip_prefix("*** Update File: ") {
+                index += 1;
+                let mut old = Vec::new();
+                let mut new = Vec::new();
+                while index < lines.len() && !lines[index].starts_with("*** ") {
+                    let patch_line = lines[index];
+                    if patch_line.starts_with("@@") {
+                        index += 1;
+                        continue;
+                    }
+                    match patch_line.chars().next() {
+                        Some(' ') => {
+                            old.push(&patch_line[1..]);
+                            new.push(&patch_line[1..]);
+                        }
+                        Some('-') => old.push(&patch_line[1..]),
+                        Some('+') => new.push(&patch_line[1..]),
+                        _ => bail!("update lines must start with space, -, +, or @@"),
+                    }
+                    index += 1;
+                }
+                self.apply_update(path, &old, &new)?;
+                changed.push(format!("updated {path}"));
+                continue;
+            }
+
+            index += 1;
         }
 
-        let output = child.wait_with_output().await?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !output.status.success() {
-            bail!("apply_patch failed\n{stdout}{stderr}");
+        if changed.is_empty() {
+            bail!("patch did not contain any supported file operations");
         }
-        Ok(format!("{stdout}{stderr}"))
+
+        Ok(changed.join("\n"))
+    }
+
+    fn apply_update(&self, path: &str, old: &[&str], new: &[&str]) -> Result<()> {
+        let path_buf = self.workspace_path(path)?;
+        let content = fs::read_to_string(&path_buf)
+            .with_context(|| format!("failed to read {}", path_buf.display()))?;
+        let old_text = join_patch_lines(old, content.ends_with('\n'));
+        let new_text = join_patch_lines(new, content.ends_with('\n'));
+        if !content.contains(&old_text) {
+            bail!("update hunk did not match {path}");
+        }
+        let updated = content.replacen(&old_text, &new_text, 1);
+        fs::write(&path_buf, updated)
+            .with_context(|| format!("failed to write {}", path_buf.display()))?;
+        Ok(())
     }
 
     async fn run_command(&self, command: &str) -> Result<String> {
@@ -132,12 +197,23 @@ impl ToolRunner {
             bail!("absolute paths are not allowed");
         }
         for component in path.components() {
-            if matches!(component, Component::ParentDir | Component::Prefix(_) | Component::RootDir) {
+            if matches!(
+                component,
+                Component::ParentDir | Component::Prefix(_) | Component::RootDir
+            ) {
                 bail!("path escapes workspace");
             }
         }
         Ok(self.root.join(path))
     }
+}
+
+fn join_patch_lines(lines: &[&str], trailing_newline: bool) -> String {
+    let mut text = lines.join("\n");
+    if trailing_newline && !text.is_empty() {
+        text.push('\n');
+    }
+    text
 }
 
 pub fn extract_tool_call(text: &str) -> Result<Option<ToolCall>> {
@@ -201,5 +277,42 @@ mod tests {
         let runner = ToolRunner::new(root.path().to_path_buf());
         assert!(runner.workspace_path("../secret").is_err());
         assert!(runner.workspace_path("/tmp/secret").is_err());
+    }
+
+    #[tokio::test]
+    async fn applies_add_file_patch_without_external_binary() {
+        let root = tempfile::tempdir().unwrap();
+        let runner = ToolRunner::new(root.path().to_path_buf());
+        let result = runner
+            .run(ToolCall::ApplyPatch {
+                patch: "*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch"
+                    .to_string(),
+            })
+            .await;
+
+        assert!(result.ok, "{}", result.output);
+        assert_eq!(
+            fs::read_to_string(root.path().join("hello.txt")).unwrap(),
+            "hello\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn applies_update_patch_without_external_binary() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("hello.txt"), "hello\nworld\n").unwrap();
+        let runner = ToolRunner::new(root.path().to_path_buf());
+        let result = runner
+            .run(ToolCall::ApplyPatch {
+                patch: "*** Begin Patch\n*** Update File: hello.txt\n@@\n hello\n-world\n+ollo\n*** End Patch"
+                    .to_string(),
+            })
+            .await;
+
+        assert!(result.ok, "{}", result.output);
+        assert_eq!(
+            fs::read_to_string(root.path().join("hello.txt")).unwrap(),
+            "hello\nollo\n"
+        );
     }
 }
