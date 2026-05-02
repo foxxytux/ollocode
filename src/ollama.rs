@@ -33,6 +33,12 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatDelta {
+    Content(String),
+    Thinking(String),
+}
+
 #[derive(Debug, Serialize)]
 struct ChatRequest<'a> {
     model: &'a str,
@@ -42,10 +48,16 @@ struct ChatRequest<'a> {
 
 #[derive(Debug, Deserialize)]
 struct ChatChunk {
-    message: Option<ChatMessage>,
+    message: Option<ChunkMessage>,
     response: Option<String>,
     done: bool,
     error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChunkMessage {
+    content: Option<String>,
+    thinking: Option<String>,
 }
 
 impl OllamaClient {
@@ -78,7 +90,7 @@ impl OllamaClient {
         mut on_delta: F,
     ) -> Result<String>
     where
-        F: FnMut(String) + Send,
+        F: FnMut(ChatDelta) + Send,
     {
         if model.is_empty() {
             bail!("no model selected");
@@ -120,13 +132,19 @@ impl OllamaClient {
                 if let Some(error) = chunk.error {
                     bail!(error);
                 }
-                let delta = chunk
-                    .message
-                    .map(|message| message.content)
-                    .or(chunk.response)
-                    .unwrap_or_default();
-                if !delta.is_empty() {
-                    on_delta(delta.clone());
+                if let Some(message) = chunk.message {
+                    if let Some(thinking) = message.thinking.filter(|value| !value.is_empty()) {
+                        on_delta(ChatDelta::Thinking(thinking.clone()));
+                        full.push_str("<think>");
+                        full.push_str(&thinking);
+                        full.push_str("</think>");
+                    }
+                    if let Some(content) = message.content.filter(|value| !value.is_empty()) {
+                        on_delta(ChatDelta::Content(content.clone()));
+                        full.push_str(&content);
+                    }
+                } else if let Some(delta) = chunk.response.filter(|value| !value.is_empty()) {
+                    on_delta(ChatDelta::Content(delta.clone()));
                     full.push_str(&delta);
                 }
                 if chunk.done {
@@ -141,13 +159,19 @@ impl OllamaClient {
             if let Some(error) = chunk.error {
                 bail!(error);
             }
-            let delta = chunk
-                .message
-                .map(|message| message.content)
-                .or(chunk.response)
-                .unwrap_or_default();
-            if !delta.is_empty() {
-                on_delta(delta.clone());
+            if let Some(message) = chunk.message {
+                if let Some(thinking) = message.thinking.filter(|value| !value.is_empty()) {
+                    on_delta(ChatDelta::Thinking(thinking.clone()));
+                    full.push_str("<think>");
+                    full.push_str(&thinking);
+                    full.push_str("</think>");
+                }
+                if let Some(content) = message.content.filter(|value| !value.is_empty()) {
+                    on_delta(ChatDelta::Content(content.clone()));
+                    full.push_str(&content);
+                }
+            } else if let Some(delta) = chunk.response.filter(|value| !value.is_empty()) {
+                on_delta(ChatDelta::Content(delta.clone()));
                 full.push_str(&delta);
             }
         }
@@ -172,6 +196,8 @@ pub fn system_prompt(agents_md: Option<&str>) -> ChatMessage {
         role: "system".to_string(),
         content: {
             let mut prompt = r#"You are ollo-code, a local autonomous coding agent running in a terminal.
+
+The full conversation history in this chat is your memory. Use previous user and assistant messages when answering. If the user asks what they just said or refers to earlier messages, answer from the messages already in this conversation instead of claiming you cannot remember.
 
 You may inspect and modify files by emitting exactly one fenced JSON tool call when a tool is needed.
 After a tool result is returned, continue from the result. Tool results are real even when ok is false. Do not claim a supported tool was unrecognized.

@@ -4,7 +4,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -125,7 +125,9 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &App, area: Rect) {
         "Transcript (scrolled)"
     };
     frame.render_widget(
-        Paragraph::new(visible).block(Block::default().title(title).borders(Borders::ALL)),
+        Paragraph::new(visible)
+            .block(Block::default().title(title).borders(Borders::ALL))
+            .wrap(Wrap { trim: false }),
         area,
     );
 }

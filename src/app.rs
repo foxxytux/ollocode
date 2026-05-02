@@ -1,7 +1,7 @@
 use crate::{
     agents,
     config::{Config, ConversationState},
-    ollama::{ChatMessage, Model, OllamaClient, system_prompt},
+    ollama::{ChatDelta, ChatMessage, Model, OllamaClient, system_prompt},
     tools::{ToolCall, ToolRunner, extract_tool_call},
 };
 use anyhow::Result;
@@ -20,6 +20,7 @@ pub struct TranscriptItem {
 pub enum AppEvent {
     ModelsLoaded(Result<Vec<Model>, String>),
     AssistantDelta(String),
+    AssistantThinkingDelta(String),
     AssistantDone(Result<String, String>),
     ToolDone(String),
     CommandDone(String),
@@ -398,7 +399,11 @@ impl App {
             let tx_delta = tx.clone();
             let result = client
                 .chat_stream(&model, &messages, move |delta| {
-                    let _ = tx_delta.send(AppEvent::AssistantDelta(delta));
+                    let event = match delta {
+                        ChatDelta::Content(content) => AppEvent::AssistantDelta(content),
+                        ChatDelta::Thinking(thinking) => AppEvent::AssistantThinkingDelta(thinking),
+                    };
+                    let _ = tx_delta.send(event);
                 })
                 .await
                 .map_err(|error| format!("{error:#}"));
@@ -438,6 +443,22 @@ impl App {
             AppEvent::AssistantDelta(delta) => {
                 self.transcript_scroll = 0;
                 self.pending_assistant.push_str(&delta);
+                if !matches!(self.transcript.last(), Some(item) if item.role == "assistant") {
+                    self.push_transcript("assistant", String::new());
+                }
+                if let Some(item) = self.transcript.last_mut() {
+                    item.content.push_str(&delta);
+                }
+            }
+            AppEvent::AssistantThinkingDelta(delta) => {
+                self.transcript_scroll = 0;
+                if matches!(self.transcript.last(), Some(item) if item.role == "assistant" && item.content.is_empty())
+                {
+                    self.transcript.pop();
+                }
+                if !matches!(self.transcript.last(), Some(item) if item.role == "thinking") {
+                    self.push_transcript("thinking", String::new());
+                }
                 if let Some(item) = self.transcript.last_mut() {
                     item.content.push_str(&delta);
                 }
