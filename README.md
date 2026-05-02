@@ -20,11 +20,13 @@ The app reads models from Ollama's local API and lets you switch models in the T
 - `Up` / `Down`: browse prompt history
 - `Left` / `Right`, `Home` / `End`: edit the prompt
 - `PageUp` / `PageDown`: scroll transcript
+- Paste: bracketed terminal paste inserts text at the cursor.
 - `Ctrl+C`: quit
 
 ## Commands
 
 - `/help`: show commands.
+- `/`: show commands.
 - `/init`: create `AGENTS.md` in the workspace.
 - `/agents`: reload and show current `AGENTS.md` status.
 - `/tools`: show model-callable tools.
@@ -41,6 +43,8 @@ The app reads models from Ollama's local API and lets you switch models in the T
 - Use the mouse wheel over the transcript to scroll.
 - Use the mouse wheel over the model pane to switch models.
 - Click inside the prompt to move the cursor.
+
+Command suggestions appear while typing `/` commands.
 
 ## Tool Calls
 

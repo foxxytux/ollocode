@@ -20,6 +20,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     draw_header(frame, app, areas.header);
     draw_transcript(frame, app, areas.transcript);
     draw_models(frame, app, areas.models);
+    draw_suggestions(frame, app, areas.suggestions);
     draw_input(frame, app, areas.input);
     draw_status(frame, app, areas.status);
 }
@@ -29,6 +30,7 @@ struct AllAreas {
     header: Rect,
     transcript: Rect,
     models: Rect,
+    suggestions: Rect,
     input: Rect,
     status: Rect,
 }
@@ -48,6 +50,7 @@ fn layout_areas(area: Rect) -> AllAreas {
         .constraints([
             Constraint::Length(3),
             Constraint::Min(8),
+            Constraint::Length(6),
             Constraint::Length(4),
             Constraint::Length(1),
         ])
@@ -62,8 +65,9 @@ fn layout_areas(area: Rect) -> AllAreas {
         header: chunks[0],
         transcript: body[0],
         models: body[1],
-        input: chunks[2],
-        status: chunks[3],
+        suggestions: chunks[2],
+        input: chunks[3],
+        status: chunks[4],
     }
 }
 
@@ -129,6 +133,37 @@ fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
         area.x.saturating_add(1).saturating_add(cursor_x),
         area.y.saturating_add(1),
     ));
+}
+
+fn draw_suggestions(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let suggestions = app.command_suggestions();
+    let lines = if suggestions.is_empty() {
+        vec![Line::from(vec![
+            Span::styled("Type / for commands", Style::default().fg(Color::DarkGray)),
+            Span::raw("   "),
+            Span::styled(
+                "Paste works with bracketed paste",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])]
+    } else {
+        suggestions
+            .iter()
+            .take(area.height.saturating_sub(2) as usize)
+            .map(|command| {
+                Line::from(vec![
+                    Span::styled(command.usage, Style::default().fg(Color::Cyan)),
+                    Span::raw("  "),
+                    Span::styled(command.description, Style::default().fg(Color::Gray)),
+                ])
+            })
+            .collect()
+    };
+
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().title("Commands").borders(Borders::ALL)),
+        area,
+    );
 }
 
 fn draw_models(frame: &mut Frame<'_>, app: &App, area: Rect) {

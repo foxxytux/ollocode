@@ -2,8 +2,8 @@ use crate::{app::App, tui};
 use anyhow::Result;
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-        MouseButton, MouseEvent, MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{
@@ -17,7 +17,12 @@ use std::{io, time::Duration};
 pub async fn run(mut app: App) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -26,6 +31,7 @@ pub async fn run(mut app: App) -> Result<()> {
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
+        DisableBracketedPaste,
         DisableMouseCapture,
         LeaveAlternateScreen
     )?;
@@ -49,6 +55,7 @@ async fn run_loop(
             match event::read()? {
                 Event::Key(key) => handle_key(app, key),
                 Event::Mouse(mouse) => handle_mouse(app, mouse)?,
+                Event::Paste(text) => app.input_insert_str(&text),
                 Event::Resize(_, _) => {}
                 _ => {}
             }

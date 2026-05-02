@@ -91,6 +91,10 @@ impl ToolRunner {
 
     fn read_file(&self, path: &str) -> Result<String> {
         let path = self.workspace_path(path)?;
+        if path.is_dir() {
+            let relative = path.strip_prefix(&self.root).unwrap_or(&path);
+            return self.list_files(relative.to_string_lossy().as_ref());
+        }
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))
     }
 
@@ -442,6 +446,21 @@ mod tests {
         assert_eq!(read.output, "hello ollo\n");
         assert!(bash.ok, "{}", bash.output);
         assert!(bash.output.contains("ok"));
+    }
+
+    #[tokio::test]
+    async fn read_directory_lists_entries() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("hello.txt"), "hello\n").unwrap();
+        let runner = ToolRunner::new(root.path().to_path_buf());
+        let result = runner
+            .run(ToolCall::Read {
+                path: ".".to_string(),
+            })
+            .await;
+
+        assert!(result.ok, "{}", result.output);
+        assert!(result.output.contains("hello.txt"));
     }
 
     #[test]

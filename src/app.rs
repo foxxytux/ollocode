@@ -47,6 +47,66 @@ pub struct App {
     agents_md: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct CommandSpec {
+    pub name: &'static str,
+    pub usage: &'static str,
+    pub description: &'static str,
+}
+
+pub const COMMANDS: &[CommandSpec] = &[
+    CommandSpec {
+        name: "/help",
+        usage: "/help",
+        description: "show commands",
+    },
+    CommandSpec {
+        name: "/init",
+        usage: "/init",
+        description: "create AGENTS.md",
+    },
+    CommandSpec {
+        name: "/agents",
+        usage: "/agents",
+        description: "reload AGENTS.md",
+    },
+    CommandSpec {
+        name: "/tools",
+        usage: "/tools",
+        description: "show model-callable tools",
+    },
+    CommandSpec {
+        name: "/model",
+        usage: "/model <name>",
+        description: "switch model",
+    },
+    CommandSpec {
+        name: "/models",
+        usage: "/models",
+        description: "list Ollama models",
+    },
+    CommandSpec {
+        name: "/bash",
+        usage: "/bash <command>",
+        description: "run shell command",
+    },
+    CommandSpec {
+        name: "/read",
+        usage: "/read <path>",
+        description: "read file or list directory",
+    },
+    CommandSpec {
+        name: "/clear",
+        usage: "/clear",
+        description: "clear transcript",
+    },
+    CommandSpec {
+        name: "/pwd",
+        usage: "/pwd",
+        description: "show workspace path",
+    },
+];
+
 impl App {
     pub async fn new(
         cwd: PathBuf,
@@ -143,6 +203,12 @@ impl App {
         self.history_cursor = None;
         self.input.insert(self.input_cursor, ch);
         self.input_cursor += ch.len_utf8();
+    }
+
+    pub fn input_insert_str(&mut self, text: &str) {
+        self.history_cursor = None;
+        self.input.insert_str(self.input_cursor, text);
+        self.input_cursor += text.len();
     }
 
     pub fn input_backspace(&mut self) {
@@ -340,8 +406,10 @@ impl App {
             AppEvent::ToolDone(content) => {
                 self.push_transcript("tool", content.clone());
                 self.messages.push(ChatMessage {
-                    role: "tool".to_string(),
-                    content: content.clone(),
+                    role: "user".to_string(),
+                    content: format!(
+                        "Tool result for your previous tool call:\n{content}\nContinue from this result. If ok is false, recover by using another supported tool or explain the failure."
+                    ),
                 });
                 if let Some(model) = self.selected_model.clone() {
                     self.start_chat(model);
@@ -395,6 +463,7 @@ impl App {
                 return;
             }
             "/pwd" => self.cwd.display().to_string(),
+            "/" => self.command_help(),
             unknown => format!("Unknown command `{unknown}`. Run /help for commands."),
         };
         self.push_transcript("system", output.clone());
@@ -406,20 +475,13 @@ impl App {
     }
 
     fn command_help(&self) -> String {
-        [
-            "Commands:",
-            "/help - show commands",
-            "/init - create AGENTS.md in this workspace",
-            "/agents - reload and show AGENTS.md status",
-            "/tools - show model-callable tools",
-            "/model <name> - switch model by exact name",
-            "/models - list Ollama models",
-            "/bash <command> - run a shell command from the workspace",
-            "/read <path> - read a workspace file",
-            "/clear - clear transcript",
-            "/pwd - show workspace path",
-        ]
-        .join("\n")
+        let mut lines = vec!["Commands:".to_string()];
+        lines.extend(
+            COMMANDS
+                .iter()
+                .map(|command| format!("{} - {}", command.usage, command.description)),
+        );
+        lines.join("\n")
     }
 
     fn command_tools(&self) -> String {
@@ -519,6 +581,27 @@ impl App {
             );
         }
     }
+
+    pub fn command_suggestions(&self) -> Vec<CommandSpec> {
+        if !self.input.starts_with('/') {
+            return Vec::new();
+        }
+        let prefix = self
+            .input
+            .split_whitespace()
+            .next()
+            .unwrap_or(self.input.as_str());
+        let suggestions: Vec<CommandSpec> = COMMANDS
+            .iter()
+            .copied()
+            .filter(|command| command.name.starts_with(prefix))
+            .collect();
+        if suggestions.is_empty() && prefix == "/" {
+            COMMANDS.to_vec()
+        } else {
+            suggestions
+        }
+    }
 }
 
 fn previous_boundary(text: &str, cursor: usize) -> Option<usize> {
@@ -537,4 +620,60 @@ fn next_boundary(text: &str, cursor: usize) -> Option<usize> {
         .nth(1)
         .map(|(index, _)| cursor + index)
         .or(Some(text.len()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_app() -> App {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let cwd = std::env::current_dir().unwrap();
+        App {
+            cwd: cwd.clone(),
+            selected_model: None,
+            config: Config::default(),
+            client: OllamaClient::new("http://127.0.0.1:11434".to_string()),
+            tools: ToolRunner::new(cwd),
+            models: Vec::new(),
+            input: String::new(),
+            input_cursor: 0,
+            history_cursor: None,
+            transcript: Vec::new(),
+            transcript_scroll: 0,
+            status: String::new(),
+            busy: false,
+            should_quit: false,
+            tx,
+            rx,
+            messages: vec![system_prompt(None)],
+            pending_assistant: String::new(),
+            agents_md: None,
+        }
+    }
+
+    #[test]
+    fn slash_predicts_all_commands() {
+        let mut app = test_app();
+        app.input = "/".to_string();
+        app.input_cursor = app.input.len();
+
+        let suggestions = app.command_suggestions();
+        assert!(suggestions.iter().any(|command| command.name == "/init"));
+        assert!(suggestions.iter().any(|command| command.name == "/bash"));
+    }
+
+    #[test]
+    fn partial_slash_predicts_matching_commands() {
+        let mut app = test_app();
+        app.input = "/mo".to_string();
+        app.input_cursor = app.input.len();
+
+        let names: Vec<&str> = app
+            .command_suggestions()
+            .iter()
+            .map(|command| command.name)
+            .collect();
+        assert_eq!(names, vec!["/model", "/models"]);
+    }
 }

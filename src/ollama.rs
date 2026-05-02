@@ -167,7 +167,7 @@ pub fn system_prompt(agents_md: Option<&str>) -> ChatMessage {
             let mut prompt = r#"You are ollo-code, a local autonomous coding agent running in a terminal.
 
 You may inspect and modify files by emitting exactly one fenced JSON tool call when a tool is needed.
-After a tool result is returned, continue from the result. Do not invent tool results.
+After a tool result is returned, continue from the result. Tool results are real even when ok is false. Do not claim a supported tool was unrecognized.
 
 Tool call format:
 ```json
