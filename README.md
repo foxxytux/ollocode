@@ -17,7 +17,17 @@ The app reads models from Ollama's local API and lets you switch models in the T
 - `Enter`: send prompt
 - `Ctrl+J` / `Ctrl+K`: select next/previous model
 - `Ctrl+M`: refresh models from Ollama
+- `Up` / `Down`: browse prompt history
+- `Left` / `Right`, `Home` / `End`: edit the prompt
+- `PageUp` / `PageDown`: scroll transcript
 - `Ctrl+C`: quit
+
+## Mouse
+
+- Click a model in the model pane to select it.
+- Use the mouse wheel over the transcript to scroll.
+- Use the mouse wheel over the model pane to switch models.
+- Click inside the prompt to move the cursor.
 
 ## Tool Calls
 

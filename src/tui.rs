@@ -1,14 +1,48 @@
 use crate::app::App;
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, List, ListItem, Paragraph},
 };
 
+#[derive(Debug, Clone, Copy)]
+pub struct UiAreas {
+    pub transcript: Rect,
+    pub models: Rect,
+    pub input: Rect,
+}
+
 pub fn draw(frame: &mut Frame<'_>, app: &App) {
-    let area = frame.area();
+    let areas = layout_areas(frame.area());
+
+    draw_header(frame, app, areas.header);
+    draw_transcript(frame, app, areas.transcript);
+    draw_models(frame, app, areas.models);
+    draw_input(frame, app, areas.input);
+    draw_status(frame, app, areas.status);
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AllAreas {
+    header: Rect,
+    transcript: Rect,
+    models: Rect,
+    input: Rect,
+    status: Rect,
+}
+
+pub fn public_areas(area: Rect) -> UiAreas {
+    let areas = layout_areas(area);
+    UiAreas {
+        transcript: areas.transcript,
+        models: areas.models,
+        input: areas.input,
+    }
+}
+
+fn layout_areas(area: Rect) -> AllAreas {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -24,11 +58,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
         .constraints([Constraint::Min(40), Constraint::Length(28)])
         .split(chunks[1]);
 
-    draw_header(frame, app, chunks[0]);
-    draw_transcript(frame, app, body[0]);
-    draw_models(frame, app, body[1]);
-    draw_input(frame, app, chunks[2]);
-    draw_status(frame, app, chunks[3]);
+    AllAreas {
+        header: chunks[0],
+        transcript: body[0],
+        models: body[1],
+        input: chunks[2],
+        status: chunks[3],
+    }
 }
 
 fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -56,50 +92,43 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn draw_transcript(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let height = area.height.saturating_sub(2) as usize;
-    let mut items = Vec::new();
+    let lines = transcript_lines(app);
+    let visible = visible_tail(&lines, height, app.transcript_scroll);
 
-    for item in app.transcript.iter().rev().take(height).rev() {
-        let style = match item.role.as_str() {
-            "user" => Style::default().fg(Color::Green),
-            "assistant" => Style::default().fg(Color::White),
-            "tool" => Style::default().fg(Color::Yellow),
-            _ => Style::default(),
-        };
-        let preview = if item.content.trim().is_empty() {
-            "..."
-        } else {
-            item.content.trim_end()
-        };
-        items.push(ListItem::new(vec![
-            Line::from(vec![
-                Span::styled(
-                    format!("{} ", item.role),
-                    style.add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    item.timestamp.format("%H:%M:%S").to_string(),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]),
-            Line::from(preview.to_string()),
-            Line::from(""),
-        ]));
-    }
-
+    let title = if app.transcript_scroll == 0 {
+        "Transcript"
+    } else {
+        "Transcript (scrolled)"
+    };
     frame.render_widget(
-        List::new(items).block(Block::default().title("Transcript").borders(Borders::ALL)),
+        Paragraph::new(visible).block(Block::default().title(title).borders(Borders::ALL)),
         area,
     );
 }
 
 fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let title = if app.busy { "Prompt (busy)" } else { "Prompt" };
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let cursor_chars = app.input[..app.input_cursor].chars().count();
+    let start_chars = cursor_chars.saturating_sub(inner_width.saturating_sub(1));
+    let visible: String = app
+        .input
+        .chars()
+        .skip(start_chars)
+        .take(inner_width)
+        .collect();
+    let cursor_x = (cursor_chars - start_chars).min(inner_width.saturating_sub(1)) as u16;
+
     frame.render_widget(
-        Paragraph::new(app.input.as_str())
+        Paragraph::new(visible)
             .block(Block::default().title(title).borders(Borders::ALL))
-            .wrap(Wrap { trim: false }),
+            .style(Style::default().fg(Color::White)),
         area,
     );
+    frame.set_cursor_position(Position::new(
+        area.x.saturating_add(1).saturating_add(cursor_x),
+        area.y.saturating_add(1),
+    ));
 }
 
 fn draw_models(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -139,4 +168,45 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Style::default().fg(Color::DarkGray)
     };
     frame.render_widget(Paragraph::new(app.status.as_str()).style(style), area);
+}
+
+fn transcript_lines(app: &App) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for item in &app.transcript {
+        let style = match item.role.as_str() {
+            "user" => Style::default().fg(Color::Green),
+            "assistant" => Style::default().fg(Color::White),
+            "tool" => Style::default().fg(Color::Yellow),
+            _ => Style::default(),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{} ", item.role),
+                style.add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                item.timestamp.format("%H:%M:%S").to_string(),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+        let content = if item.content.trim().is_empty() {
+            "..."
+        } else {
+            item.content.trim_end()
+        };
+        for line in content.lines() {
+            lines.push(Line::from(line.to_string()));
+        }
+        lines.push(Line::from(""));
+    }
+    lines
+}
+
+fn visible_tail(lines: &[Line<'static>], height: usize, scroll: usize) -> Vec<Line<'static>> {
+    if lines.len() <= height {
+        return lines.to_vec();
+    }
+    let end = lines.len().saturating_sub(scroll).max(height);
+    let start = end.saturating_sub(height);
+    lines[start..end].to_vec()
 }
