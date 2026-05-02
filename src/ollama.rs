@@ -149,27 +149,44 @@ impl OllamaClient {
     }
 }
 
-pub fn system_prompt() -> ChatMessage {
+pub fn system_prompt(agents_md: Option<&str>) -> ChatMessage {
+    let agents_section = agents_md
+        .map(|content| {
+            format!(
+                "\n\nProject instructions from AGENTS.md:\n---\n{}\n---",
+                content.trim()
+            )
+        })
+        .unwrap_or_else(|| {
+            "\n\nNo AGENTS.md was found. The user can run /init to create one.".to_string()
+        });
+
     ChatMessage {
         role: "system".to_string(),
-        content: r#"You are Ollo Code, a local autonomous coding agent running in a terminal.
+        content: {
+            let mut prompt = r#"You are ollo-code, a local autonomous coding agent running in a terminal.
 
 You may inspect and modify files by emitting exactly one fenced JSON tool call when a tool is needed.
 After a tool result is returned, continue from the result. Do not invent tool results.
 
 Tool call format:
 ```json
-{"tool":"read_file","path":"src/main.rs"}
+{"tool":"read","path":"src/main.rs"}
 ```
 
 Supported tools:
-- list_files: {"tool":"list_files","path":"."}
-- read_file: {"tool":"read_file","path":"relative/path"}
-- write_file: {"tool":"write_file","path":"relative/path","content":"full file content"}
-- apply_patch: {"tool":"apply_patch","patch":"*** Begin Patch\n..."}
-- run_command: {"tool":"run_command","command":"cargo check"}
+- bash: {"tool":"bash","command":"cargo check"}
+- read: {"tool":"read","path":"relative/path"}
+- write: {"tool":"write","path":"relative/path","content":"full file content"}
+- edit: {"tool":"edit","path":"relative/path","old":"exact old text","new":"replacement text"}
+- list: {"tool":"list","path":"."}
+- search: {"tool":"search","query":"symbol or text","path":"optional/path"}
+- patch: {"tool":"patch","patch":"*** Begin Patch\n..."}
 
-Prefer reading before editing. Keep changes focused."#
-            .to_string(),
+The required core tools are bash, read, write, and edit. Prefer read before edit/write. Use search before broad reads. Keep changes focused."#
+                .to_string();
+            prompt.push_str(&agents_section);
+            prompt
+        },
     }
 }

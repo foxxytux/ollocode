@@ -71,7 +71,7 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let model = app.selected_model.as_deref().unwrap_or("no model selected");
     let text = vec![
         Line::from(vec![
-            Span::styled("Ollo Code", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled("ollo-code", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("  "),
             Span::styled(model, Style::default().fg(Color::Cyan)),
         ]),
@@ -81,7 +81,7 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 app.cwd.display().to_string(),
                 Style::default().fg(Color::DarkGray),
             ),
-            Span::raw("   Ctrl+J/K model  Ctrl+M refresh  Ctrl+C quit"),
+            Span::raw("   /help commands  Ctrl+J/K model  Ctrl+M refresh  Ctrl+C quit"),
         ]),
     ];
     frame.render_widget(

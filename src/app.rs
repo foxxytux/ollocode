@@ -1,7 +1,8 @@
 use crate::{
+    agents,
     config::Config,
     ollama::{ChatMessage, Model, OllamaClient, system_prompt},
-    tools::{ToolRunner, extract_tool_call},
+    tools::{ToolCall, ToolRunner, extract_tool_call},
 };
 use anyhow::Result;
 use chrono::{DateTime, Local};
@@ -21,6 +22,7 @@ pub enum AppEvent {
     AssistantDelta(String),
     AssistantDone(Result<String, String>),
     ToolDone(String),
+    CommandDone(String),
 }
 
 pub struct App {
@@ -42,6 +44,7 @@ pub struct App {
     pub rx: mpsc::UnboundedReceiver<AppEvent>,
     messages: Vec<ChatMessage>,
     pending_assistant: String,
+    agents_md: Option<String>,
 }
 
 impl App {
@@ -52,6 +55,7 @@ impl App {
         tools: ToolRunner,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
+        let agents_md = agents::load(&cwd);
         let mut app = Self {
             cwd,
             selected_model: config.selected_model.clone(),
@@ -69,10 +73,12 @@ impl App {
             should_quit: false,
             tx,
             rx,
-            messages: vec![system_prompt()],
+            messages: vec![system_prompt(agents_md.as_deref())],
             pending_assistant: String::new(),
+            agents_md,
         };
         app.refresh_models();
+        app.report_agents_status();
         app
     }
 
@@ -210,10 +216,6 @@ impl App {
         if prompt.is_empty() {
             return;
         }
-        let Some(model) = self.selected_model.clone() else {
-            self.status = "Select an Ollama model first".to_string();
-            return;
-        };
 
         self.input.clear();
         self.input_cursor = 0;
@@ -223,6 +225,16 @@ impl App {
             self.config.prompt_history.remove(0);
         }
         let _ = self.config.save();
+
+        if prompt.starts_with('/') {
+            self.handle_command(&prompt);
+            return;
+        }
+
+        let Some(model) = self.selected_model.clone() else {
+            self.status = "Select an Ollama model first".to_string();
+            return;
+        };
 
         self.push_transcript("user", prompt.clone());
         self.messages.push(ChatMessage {
@@ -335,6 +347,14 @@ impl App {
                     self.start_chat(model);
                 }
             }
+            AppEvent::CommandDone(content) => {
+                self.push_transcript("system", content.clone());
+                self.status = content
+                    .lines()
+                    .next()
+                    .unwrap_or("Command complete")
+                    .to_string();
+            }
         }
     }
 
@@ -345,6 +365,159 @@ impl App {
             content,
             timestamp: Local::now(),
         });
+    }
+
+    fn handle_command(&mut self, command: &str) {
+        self.push_transcript("command", command.to_string());
+        let mut parts = command.split_whitespace();
+        let name = parts.next().unwrap_or_default();
+        let output = match name {
+            "/help" => self.command_help(),
+            "/init" => self.command_init(),
+            "/agents" => self.command_agents(),
+            "/tools" => self.command_tools(),
+            "/model" => {
+                let model = parts.collect::<Vec<_>>().join(" ");
+                self.command_model(&model)
+            }
+            "/models" => self.command_models(),
+            "/bash" => {
+                let command = parts.collect::<Vec<_>>().join(" ");
+                self.command_tool(ToolCall::Bash { command }, "Running bash command")
+            }
+            "/read" => {
+                let path = parts.collect::<Vec<_>>().join(" ");
+                self.command_tool(ToolCall::Read { path }, "Reading file")
+            }
+            "/clear" => {
+                self.transcript.clear();
+                self.status = "Transcript cleared".to_string();
+                return;
+            }
+            "/pwd" => self.cwd.display().to_string(),
+            unknown => format!("Unknown command `{unknown}`. Run /help for commands."),
+        };
+        self.push_transcript("system", output.clone());
+        self.status = output
+            .lines()
+            .next()
+            .unwrap_or("Command complete")
+            .to_string();
+    }
+
+    fn command_help(&self) -> String {
+        [
+            "Commands:",
+            "/help - show commands",
+            "/init - create AGENTS.md in this workspace",
+            "/agents - reload and show AGENTS.md status",
+            "/tools - show model-callable tools",
+            "/model <name> - switch model by exact name",
+            "/models - list Ollama models",
+            "/bash <command> - run a shell command from the workspace",
+            "/read <path> - read a workspace file",
+            "/clear - clear transcript",
+            "/pwd - show workspace path",
+        ]
+        .join("\n")
+    }
+
+    fn command_tools(&self) -> String {
+        [
+            "Model tools:",
+            "bash { command } - run a shell command",
+            "read { path } - read a file",
+            "write { path, content } - write a full file",
+            "edit { path, old, new } - replace exact text once",
+            "list { path } - list a directory",
+            "search { query, path? } - search text with rg",
+            "patch { patch } - apply an apply_patch-style patch",
+            "",
+            "Core tools guaranteed here: bash, read, write, edit.",
+        ]
+        .join("\n")
+    }
+
+    fn command_init(&mut self) -> String {
+        match agents::init(&self.cwd) {
+            Ok(path) => {
+                self.reload_agents();
+                format!("Created {}", path.display())
+            }
+            Err(error) => format!("{error:#}"),
+        }
+    }
+
+    fn command_agents(&mut self) -> String {
+        self.reload_agents();
+        match &self.agents_md {
+            Some(content) => format!(
+                "Loaded AGENTS.md ({} bytes). Its instructions are included in future prompts.",
+                content.len()
+            ),
+            None => "No AGENTS.md found. Run /init to create one.".to_string(),
+        }
+    }
+
+    fn command_model(&mut self, model: &str) -> String {
+        if model.trim().is_empty() {
+            return "Usage: /model <exact model name>".to_string();
+        }
+        if let Some(index) = self.models.iter().position(|item| item.name == model) {
+            self.select_model_index(index);
+            format!("Selected {model}")
+        } else {
+            format!("Model `{model}` is not loaded. Run /models to see available models.")
+        }
+    }
+
+    fn command_models(&self) -> String {
+        if self.models.is_empty() {
+            return "No models loaded. Run Ctrl+M to refresh Ollama models.".to_string();
+        }
+        self.models
+            .iter()
+            .map(|model| {
+                if self.selected_model.as_deref() == Some(model.name.as_str()) {
+                    format!("> {}", model.name)
+                } else {
+                    format!("  {}", model.name)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn command_tool(&mut self, call: ToolCall, status: &str) -> String {
+        let tools = self.tools.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = tools.run(call).await;
+            let prefix = if result.ok { "ok" } else { "error" };
+            let _ = tx.send(AppEvent::CommandDone(format!(
+                "{prefix}\n{}",
+                result.output
+            )));
+        });
+        status.to_string()
+    }
+
+    fn reload_agents(&mut self) {
+        self.agents_md = agents::load(&self.cwd);
+        if let Some(system) = self.messages.first_mut() {
+            *system = system_prompt(self.agents_md.as_deref());
+        }
+    }
+
+    fn report_agents_status(&mut self) {
+        if self.agents_md.is_some() {
+            self.push_transcript("system", "Loaded AGENTS.md instructions.".to_string());
+        } else {
+            self.push_transcript(
+                "system",
+                "No AGENTS.md found. Run /init to create one.".to_string(),
+            );
+        }
     }
 }
 

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 use std::{
     fs,
     path::{Component, Path, PathBuf},
@@ -12,14 +13,33 @@ pub struct ToolRunner {
     root: PathBuf,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(tag = "tool", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolCall {
-    ListFiles { path: String },
-    ReadFile { path: String },
-    WriteFile { path: String, content: String },
-    ApplyPatch { patch: String },
-    RunCommand { command: String },
+    Bash {
+        command: String,
+    },
+    Read {
+        path: String,
+    },
+    Write {
+        path: String,
+        content: String,
+    },
+    Edit {
+        path: String,
+        old: String,
+        new: String,
+    },
+    List {
+        path: String,
+    },
+    Search {
+        query: String,
+        path: Option<String>,
+    },
+    Patch {
+        patch: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -45,11 +65,13 @@ impl ToolRunner {
 
     async fn run_inner(&self, call: ToolCall) -> Result<String> {
         match call {
-            ToolCall::ListFiles { path } => self.list_files(&path),
-            ToolCall::ReadFile { path } => self.read_file(&path),
-            ToolCall::WriteFile { path, content } => self.write_file(&path, &content),
-            ToolCall::ApplyPatch { patch } => self.apply_patch(&patch),
-            ToolCall::RunCommand { command } => self.run_command(&command).await,
+            ToolCall::Bash { command } => self.run_command(&command).await,
+            ToolCall::Read { path } => self.read_file(&path),
+            ToolCall::Write { path, content } => self.write_file(&path, &content),
+            ToolCall::Edit { path, old, new } => self.edit_file(&path, &old, &new),
+            ToolCall::List { path } => self.list_files(&path),
+            ToolCall::Search { query, path } => self.search(&query, path.as_deref()).await,
+            ToolCall::Patch { patch } => self.apply_patch(&patch),
         }
     }
 
@@ -83,6 +105,22 @@ impl ToolRunner {
             "wrote {}",
             path.strip_prefix(&self.root).unwrap_or(&path).display()
         ))
+    }
+
+    fn edit_file(&self, path: &str, old: &str, new: &str) -> Result<String> {
+        if old.is_empty() {
+            bail!("old text cannot be empty");
+        }
+        let path_buf = self.workspace_path(path)?;
+        let content = fs::read_to_string(&path_buf)
+            .with_context(|| format!("failed to read {}", path_buf.display()))?;
+        if !content.contains(old) {
+            bail!("old text was not found in {path}");
+        }
+        let updated = content.replacen(old, new, 1);
+        fs::write(&path_buf, updated)
+            .with_context(|| format!("failed to write {}", path_buf.display()))?;
+        Ok(format!("edited {path}"))
     }
 
     fn apply_patch(&self, patch: &str) -> Result<String> {
@@ -191,6 +229,41 @@ impl ToolRunner {
         Ok(text)
     }
 
+    async fn search(&self, query: &str, path: Option<&str>) -> Result<String> {
+        if query.trim().is_empty() {
+            bail!("query cannot be empty");
+        }
+        let path = path.unwrap_or(".");
+        let checked_path = self.workspace_path(path)?;
+        let relative_path = checked_path
+            .strip_prefix(&self.root)
+            .unwrap_or(&checked_path);
+        let output = Command::new("rg")
+            .arg("--line-number")
+            .arg("--hidden")
+            .arg("--glob")
+            .arg("!target")
+            .arg("--glob")
+            .arg("!.git")
+            .arg(query)
+            .arg(relative_path)
+            .current_dir(&self.root)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .context("failed to run rg")?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.code() == Some(1) {
+            return Ok("no matches".to_string());
+        }
+        if !output.status.success() {
+            bail!("search failed\n{stdout}{stderr}");
+        }
+        Ok(stdout.to_string())
+    }
+
     pub fn workspace_path(&self, path: &str) -> Result<PathBuf> {
         let path = Path::new(path);
         if path.is_absolute() {
@@ -205,6 +278,64 @@ impl ToolRunner {
             }
         }
         Ok(self.root.join(path))
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolCall {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let tool = value
+            .get("tool")
+            .and_then(Value::as_str)
+            .ok_or_else(|| serde::de::Error::custom("tool field is required"))?;
+
+        let string_field = |name: &str| -> Result<String, D::Error> {
+            value
+                .get(name)
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+                .ok_or_else(|| serde::de::Error::custom(format!("{name} field is required")))
+        };
+
+        match tool {
+            "bash" | "run_command" => Ok(Self::Bash {
+                command: string_field("command")?,
+            }),
+            "read" | "read_file" => Ok(Self::Read {
+                path: string_field("path")?,
+            }),
+            "write" | "write_file" => Ok(Self::Write {
+                path: string_field("path")?,
+                content: string_field("content")?,
+            }),
+            "edit" => Ok(Self::Edit {
+                path: string_field("path")?,
+                old: string_field("old")?,
+                new: string_field("new")?,
+            }),
+            "list" | "list_files" => Ok(Self::List {
+                path: string_field("path")?,
+            }),
+            "search" | "grep" => {
+                let path = value
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                Ok(Self::Search {
+                    query: string_field("query")?,
+                    path,
+                })
+            }
+            "patch" | "apply_patch" => Ok(Self::Patch {
+                patch: string_field("patch")?,
+            }),
+            unknown => Err(serde::de::Error::custom(format!(
+                "unknown tool `{unknown}`"
+            ))),
+        }
     }
 }
 
@@ -265,7 +396,7 @@ mod tests {
         let call = extract_tool_call(text).unwrap().unwrap();
         assert_eq!(
             call,
-            ToolCall::ReadFile {
+            ToolCall::Read {
                 path: "Cargo.toml".to_string()
             }
         );
@@ -280,11 +411,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn supports_core_four_tool_names() {
+        let root = tempfile::tempdir().unwrap();
+        let runner = ToolRunner::new(root.path().to_path_buf());
+        runner
+            .run(ToolCall::Write {
+                path: "hello.txt".to_string(),
+                content: "hello world\n".to_string(),
+            })
+            .await;
+        let edit = runner
+            .run(ToolCall::Edit {
+                path: "hello.txt".to_string(),
+                old: "world".to_string(),
+                new: "ollo".to_string(),
+            })
+            .await;
+        let read = runner
+            .run(ToolCall::Read {
+                path: "hello.txt".to_string(),
+            })
+            .await;
+        let bash = runner
+            .run(ToolCall::Bash {
+                command: "printf ok".to_string(),
+            })
+            .await;
+
+        assert!(edit.ok, "{}", edit.output);
+        assert_eq!(read.output, "hello ollo\n");
+        assert!(bash.ok, "{}", bash.output);
+        assert!(bash.output.contains("ok"));
+    }
+
+    #[test]
+    fn parses_search_tool() {
+        let call: ToolCall =
+            serde_json::from_str(r#"{"tool":"search","query":"fn main","path":"src"}"#).unwrap();
+        assert_eq!(
+            call,
+            ToolCall::Search {
+                query: "fn main".to_string(),
+                path: Some("src".to_string())
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn applies_add_file_patch_without_external_binary() {
         let root = tempfile::tempdir().unwrap();
         let runner = ToolRunner::new(root.path().to_path_buf());
         let result = runner
-            .run(ToolCall::ApplyPatch {
+            .run(ToolCall::Patch {
                 patch: "*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch"
                     .to_string(),
             })
@@ -303,7 +481,7 @@ mod tests {
         fs::write(root.path().join("hello.txt"), "hello\nworld\n").unwrap();
         let runner = ToolRunner::new(root.path().to_path_buf());
         let result = runner
-            .run(ToolCall::ApplyPatch {
+            .run(ToolCall::Patch {
                 patch: "*** Begin Patch\n*** Update File: hello.txt\n@@\n hello\n-world\n+ollo\n*** End Patch"
                     .to_string(),
             })

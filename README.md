@@ -1,4 +1,4 @@
-# Ollo Code
+# ollo-code
 
 A local-first terminal coding agent for Ollama models.
 
@@ -22,6 +22,19 @@ The app reads models from Ollama's local API and lets you switch models in the T
 - `PageUp` / `PageDown`: scroll transcript
 - `Ctrl+C`: quit
 
+## Commands
+
+- `/help`: show commands.
+- `/init`: create `AGENTS.md` in the workspace.
+- `/agents`: reload and show current `AGENTS.md` status.
+- `/tools`: show model-callable tools.
+- `/model <name>`: switch to an Ollama model by exact name.
+- `/models`: list available Ollama models.
+- `/bash <command>`: run a local shell command from the workspace.
+- `/read <path>`: read a workspace file into the transcript.
+- `/clear`: clear the transcript.
+- `/pwd`: show the current workspace path.
+
 ## Mouse
 
 - Click a model in the model pane to select it.
@@ -34,15 +47,17 @@ The app reads models from Ollama's local API and lets you switch models in the T
 The model can request local tools by emitting fenced JSON:
 
 ```json
-{"tool":"read_file","path":"src/main.rs"}
+{"tool":"read","path":"src/main.rs"}
 ```
 
-Supported tools:
+Supported model tools:
 
-- `list_files`
-- `read_file`
-- `write_file`
-- `apply_patch`
-- `run_command`
+- `bash`
+- `read`
+- `write`
+- `edit`
+- `list`
+- `search`
+- `patch`
 
 Tools run from the workspace root. File paths are restricted to the workspace.
