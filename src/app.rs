@@ -1,6 +1,6 @@
 use crate::{
     agents,
-    config::Config,
+    config::{Config, ConversationState},
     ollama::{ChatMessage, Model, OllamaClient, system_prompt},
     tools::{ToolCall, ToolRunner, extract_tool_call},
 };
@@ -102,6 +102,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "clear transcript",
     },
     CommandSpec {
+        name: "/context",
+        usage: "/context",
+        description: "show restored context usage",
+    },
+    CommandSpec {
         name: "/pwd",
         usage: "/pwd",
         description: "show workspace path",
@@ -117,6 +122,14 @@ impl App {
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let agents_md = agents::load(&cwd);
+        let restored = ConversationState::load(&cwd).unwrap_or_default();
+        let mut messages = vec![system_prompt(agents_md.as_deref())];
+        messages.extend(
+            restored
+                .messages
+                .into_iter()
+                .filter(|message| message.role != "system"),
+        );
         let mut app = Self {
             cwd,
             selected_model: config.selected_model.clone(),
@@ -135,10 +148,11 @@ impl App {
             should_quit: false,
             tx,
             rx,
-            messages: vec![system_prompt(agents_md.as_deref())],
+            messages,
             pending_assistant: String::new(),
             agents_md,
         };
+        app.restore_transcript_from_messages();
         app.refresh_models();
         app.report_agents_status();
         app
@@ -189,6 +203,21 @@ impl App {
             self.config.selected_model = self.selected_model.clone();
             self.status = format!("Selected {}", model.name);
             let _ = self.config.save();
+        }
+    }
+
+    pub fn context_percent(&self) -> Option<u16> {
+        let limit = self.selected_model_context_limit()?;
+        let used = self.approx_context_tokens();
+        Some(((used.saturating_mul(100)) / limit).min(999) as u16)
+    }
+
+    pub fn context_label(&self) -> String {
+        match (self.context_percent(), self.selected_model_context_limit()) {
+            (Some(percent), Some(limit)) => {
+                format!("ctx {percent}% ~{}/{}", self.approx_context_tokens(), limit)
+            }
+            _ => format!("ctx ~{} tokens", self.approx_context_tokens()),
         }
     }
 
@@ -351,6 +380,7 @@ impl App {
             role: "user".to_string(),
             content: prompt,
         });
+        self.save_conversation();
         self.start_chat(model);
     }
 
@@ -418,6 +448,7 @@ impl App {
                     role: "assistant".to_string(),
                     content: content.clone(),
                 });
+                self.save_conversation();
                 self.status = "Assistant response complete".to_string();
 
                 match extract_tool_call(&content) {
@@ -455,6 +486,7 @@ impl App {
                         "Tool result for your previous tool call:\n{content}\nContinue from this result. If ok is false, recover by using another supported tool or explain the failure."
                     ),
                 });
+                self.save_conversation();
                 if let Some(model) = self.selected_model.clone() {
                     self.start_chat(model);
                 }
@@ -503,9 +535,12 @@ impl App {
             }
             "/clear" => {
                 self.transcript.clear();
+                self.messages.truncate(1);
+                let _ = ConversationState::clear(&self.cwd);
                 self.status = "Transcript cleared".to_string();
                 return;
             }
+            "/context" => self.context_status(),
             "/pwd" => self.cwd.display().to_string(),
             "/" => self.command_help(),
             unknown => format!("Unknown command `{unknown}`. Run /help for commands."),
@@ -608,11 +643,23 @@ impl App {
         status.to_string()
     }
 
+    fn context_status(&self) -> String {
+        format!(
+            "{}\n{} persisted conversation messages",
+            self.context_label(),
+            self.messages
+                .iter()
+                .filter(|message| message.role != "system")
+                .count()
+        )
+    }
+
     fn reload_agents(&mut self) {
         self.agents_md = agents::load(&self.cwd);
         if let Some(system) = self.messages.first_mut() {
             *system = system_prompt(self.agents_md.as_deref());
         }
+        self.save_conversation();
     }
 
     fn report_agents_status(&mut self) {
@@ -655,6 +702,72 @@ impl App {
             self.command_cursor = self.command_cursor.min(len - 1);
         }
     }
+
+    fn restore_transcript_from_messages(&mut self) {
+        let restored: Vec<(String, String)> = self
+            .messages
+            .iter()
+            .filter(|message| message.role != "system")
+            .map(|message| {
+                let role = if message
+                    .content
+                    .starts_with("Tool result for your previous tool call:")
+                {
+                    "tool".to_string()
+                } else {
+                    message.role.clone()
+                };
+                (role, message.content.clone())
+            })
+            .collect();
+        for (role, content) in restored {
+            self.push_transcript(&role, content);
+        }
+        if !self.transcript.is_empty() {
+            self.status = format!("Restored {} conversation messages", self.transcript.len());
+        }
+    }
+
+    fn save_conversation(&self) {
+        let _ = ConversationState::save(&self.cwd, &self.messages);
+    }
+
+    fn approx_context_tokens(&self) -> usize {
+        self.messages
+            .iter()
+            .map(|message| approximate_tokens(&message.content) + 4)
+            .sum()
+    }
+
+    fn selected_model_context_limit(&self) -> Option<usize> {
+        let name = self.selected_model.as_ref()?;
+        let lower = name.to_lowercase();
+        let details = self
+            .models
+            .iter()
+            .find(|model| &model.name == name)
+            .and_then(|model| model.details.as_ref());
+        let params = details
+            .and_then(|details| details.parameter_size.as_deref())
+            .unwrap_or(&lower)
+            .to_lowercase();
+
+        if lower.contains("granite4") || lower.contains("qwen3.5") || lower.contains("gemma4") {
+            Some(32_768)
+        } else if lower.contains("nemotron") {
+            Some(128_000)
+        } else if params.contains("0.4b") || params.contains("350m") {
+            Some(8_192)
+        } else if params.contains("0.8b") || params.contains("2b") || params.contains("4b") {
+            Some(32_768)
+        } else {
+            Some(8_192)
+        }
+    }
+}
+
+fn approximate_tokens(text: &str) -> usize {
+    (text.chars().count() / 4).max(1)
 }
 
 fn previous_boundary(text: &str, cursor: usize) -> Option<usize> {
@@ -744,5 +857,24 @@ mod tests {
         assert_eq!(app.selected_command_index(), 1);
         app.command_selection_up();
         assert_eq!(app.selected_command_index(), 0);
+    }
+
+    #[test]
+    fn context_percent_uses_selected_model() {
+        let mut app = test_app();
+        app.selected_model = Some("granite4:350m".to_string());
+        app.models = vec![Model {
+            name: "granite4:350m".to_string(),
+            size: None,
+            modified_at: None,
+            details: None,
+        }];
+        app.messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: "hello".repeat(100),
+        });
+
+        assert!(app.context_percent().is_some());
+        assert!(app.context_label().starts_with("ctx "));
     }
 }

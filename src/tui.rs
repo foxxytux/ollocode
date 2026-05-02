@@ -96,6 +96,8 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Span::styled("ollo-code", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("  "),
             Span::styled(model, Style::default().fg(Color::Cyan)),
+            Span::raw("  "),
+            Span::styled(app.context_label(), Style::default().fg(Color::Yellow)),
         ]),
         Line::from(vec![
             Span::raw("cwd "),

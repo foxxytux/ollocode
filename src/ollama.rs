@@ -13,6 +13,13 @@ pub struct Model {
     pub name: String,
     pub size: Option<u64>,
     pub modified_at: Option<String>,
+    pub details: Option<ModelDetails>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ModelDetails {
+    pub parameter_size: Option<String>,
+    pub quantization_level: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

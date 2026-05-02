@@ -11,6 +11,7 @@ cargo run
 ```
 
 The app reads models from Ollama's local API and lets you switch models in the TUI.
+Conversation context is restored per workspace, and the header shows an approximate context-window percentage for the selected model.
 
 ## Keys
 
@@ -36,6 +37,7 @@ The app reads models from Ollama's local API and lets you switch models in the T
 - `/bash <command>`: run a local shell command from the workspace.
 - `/read <path>`: read a workspace file into the transcript.
 - `/clear`: clear the transcript.
+- `/context`: show restored context usage.
 - `/pwd`: show the current workspace path.
 
 ## Mouse
