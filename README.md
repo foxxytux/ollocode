@@ -14,6 +14,14 @@ The app reads models from Ollama's local API and lets you switch models in the T
 Conversation context is restored per workspace, and the header shows an approximate context-window percentage for the selected model.
 Model output wrapped in `<think>...</think>` is shown in the transcript as `thinking`.
 
+## Install
+
+```sh
+./scripts/install.sh
+```
+
+That builds the release binary and installs `ollo-code` into `~/.local/bin`.
+
 ## Keys
 
 - `Enter`: send prompt

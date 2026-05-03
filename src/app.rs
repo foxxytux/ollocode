@@ -47,6 +47,7 @@ pub struct App {
     messages: Vec<ChatMessage>,
     pending_assistant: String,
     response_start: Option<usize>,
+    stream_role: Option<String>,
     agents_md: Option<String>,
 }
 
@@ -153,6 +154,7 @@ impl App {
             messages,
             pending_assistant: String::new(),
             response_start: None,
+            stream_role: None,
             agents_md,
         };
         app.restore_transcript_from_messages();
@@ -395,7 +397,7 @@ impl App {
         self.transcript_scroll = 0;
         self.pending_assistant.clear();
         self.response_start = Some(self.transcript.len());
-        self.push_transcript("assistant", String::new());
+        self.stream_role = None;
         self.status = format!("Streaming from {model}");
         let client = self.client.clone();
         let messages = self.messages.clone();
@@ -449,28 +451,15 @@ impl App {
             AppEvent::AssistantDelta(delta) => {
                 self.transcript_scroll = 0;
                 self.pending_assistant.push_str(&delta);
-                if !matches!(self.transcript.last(), Some(item) if item.role == "assistant") {
-                    self.push_transcript("assistant", String::new());
-                }
-                if let Some(item) = self.transcript.last_mut() {
-                    item.content.push_str(&delta);
-                }
+                self.append_stream_delta("assistant", delta);
             }
             AppEvent::AssistantThinkingDelta(delta) => {
                 self.transcript_scroll = 0;
-                if matches!(self.transcript.last(), Some(item) if item.role == "assistant" && item.content.is_empty())
-                {
-                    self.transcript.pop();
-                }
-                if !matches!(self.transcript.last(), Some(item) if item.role == "thinking") {
-                    self.push_transcript("thinking", String::new());
-                }
-                if let Some(item) = self.transcript.last_mut() {
-                    item.content.push_str(&delta);
-                }
+                self.append_stream_delta("thinking", delta);
             }
             AppEvent::AssistantDone(Ok(content)) => {
                 self.busy = false;
+                self.stream_role = None;
                 self.messages.push(ChatMessage {
                     role: "assistant".to_string(),
                     content: content.clone(),
@@ -500,6 +489,7 @@ impl App {
             AppEvent::AssistantDone(Err(error)) => {
                 self.busy = false;
                 self.response_start = None;
+                self.stream_role = None;
                 self.status = format!("Chat error: {error}");
                 if let Some(item) = self.transcript.last_mut() {
                     if item.role == "assistant" && item.content.is_empty() {
@@ -562,6 +552,22 @@ impl App {
                 self.push_transcript(&role, content);
             }
         }
+    }
+
+    fn append_stream_delta(&mut self, role: &str, delta: String) {
+        match self.stream_role.as_deref() {
+            Some(current) if current == role => {
+                if let Some(item) = self.transcript.last_mut() {
+                    item.content.push_str(&delta);
+                    return;
+                }
+            }
+            Some(_) => {}
+            None => {}
+        }
+
+        self.stream_role = Some(role.to_string());
+        self.push_transcript(role, delta);
     }
 
     fn handle_command(&mut self, command: &str) {
@@ -936,6 +942,7 @@ mod tests {
             messages: vec![system_prompt(None)],
             pending_assistant: String::new(),
             response_start: None,
+            stream_role: None,
             agents_md: None,
         }
     }
