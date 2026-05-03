@@ -4,7 +4,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, List, ListItem, Paragraph},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -116,7 +116,7 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn draw_transcript(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let height = area.height.saturating_sub(2) as usize;
-    let lines = transcript_lines(app);
+    let lines = transcript_lines(app, area.width.saturating_sub(2) as usize);
     let visible = visible_tail(&lines, height, app.transcript_scroll);
 
     let title = if app.transcript_scroll == 0 {
@@ -125,9 +125,7 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &App, area: Rect) {
         "Transcript (scrolled)"
     };
     frame.render_widget(
-        Paragraph::new(visible)
-            .block(Block::default().title(title).borders(Borders::ALL))
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(visible).block(Block::default().title(title).borders(Borders::ALL)),
         area,
     );
 }
@@ -228,7 +226,7 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(app.status.as_str()).style(style), area);
 }
 
-fn transcript_lines(app: &App) -> Vec<Line<'static>> {
+fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for item in &app.transcript {
         let style = match item.role.as_str() {
@@ -253,12 +251,82 @@ fn transcript_lines(app: &App) -> Vec<Line<'static>> {
         } else {
             item.content.trim_end()
         };
-        for line in content.lines() {
-            lines.push(Line::from(line.to_string()));
+        for line in wrap_text(content, width) {
+            lines.push(Line::from(line));
         }
         lines.push(Line::from(""));
     }
     lines
+}
+
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+
+    let mut out = Vec::new();
+    for raw_line in text.lines() {
+        if raw_line.trim().is_empty() {
+            out.push(String::new());
+            continue;
+        }
+
+        let mut current = String::new();
+        let mut current_len = 0usize;
+
+        for word in raw_line.split_whitespace() {
+            let word_len = word.chars().count();
+            let sep = if current.is_empty() { 0 } else { 1 };
+
+            if word_len > width {
+                if !current.is_empty() {
+                    out.push(current);
+                    current = String::new();
+                    current_len = 0;
+                }
+                let mut chunk = String::new();
+                let mut chunk_len = 0usize;
+                for ch in word.chars() {
+                    chunk.push(ch);
+                    chunk_len += 1;
+                    if chunk_len >= width {
+                        out.push(chunk);
+                        chunk = String::new();
+                        chunk_len = 0;
+                    }
+                }
+                if !chunk.is_empty() {
+                    current = chunk;
+                    current_len = chunk_len;
+                }
+                continue;
+            }
+
+            if current_len + sep + word_len > width {
+                if !current.is_empty() {
+                    out.push(current);
+                }
+                current = word.to_string();
+                current_len = word_len;
+            } else {
+                if !current.is_empty() {
+                    current.push(' ');
+                    current_len += 1;
+                }
+                current.push_str(word);
+                current_len += word_len;
+            }
+        }
+
+        if !current.is_empty() {
+            out.push(current);
+        }
+    }
+
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
 }
 
 fn visible_tail(lines: &[Line<'static>], height: usize, scroll: usize) -> Vec<Line<'static>> {
