@@ -531,26 +531,17 @@ impl App {
     }
 
     fn replace_latest_assistant_with_parts(&mut self, content: &str) {
-        let parts = split_thinking(content);
-        if parts.len() == 1 && parts[0].0 == "assistant" {
-            self.response_start = None;
-            if let Some(item) = self.transcript.last_mut() {
-                if item.role == "assistant" {
-                    item.content = parts[0].1.clone();
-                }
-            }
-            return;
-        }
-
+        let (thinking, assistant) = split_thinking(content);
         if let Some(start) = self.response_start.take() {
             self.transcript.truncate(start);
         } else if matches!(self.transcript.last(), Some(item) if item.role == "assistant") {
             self.transcript.pop();
         }
-        for (role, content) in parts {
-            if !content.trim().is_empty() {
-                self.push_transcript(&role, content);
-            }
+        if !thinking.trim().is_empty() {
+            self.push_transcript("thinking", thinking);
+        }
+        if !assistant.trim().is_empty() {
+            self.push_transcript("assistant", assistant);
         }
     }
 
@@ -800,7 +791,15 @@ impl App {
                     message.role.clone()
                 };
                 if role == "assistant" {
-                    split_thinking(&message.content)
+                    let (thinking, assistant) = split_thinking(&message.content);
+                    let mut items = Vec::new();
+                    if !thinking.trim().is_empty() {
+                        items.push(("thinking".to_string(), thinking));
+                    }
+                    if !assistant.trim().is_empty() {
+                        items.push(("assistant".to_string(), assistant));
+                    }
+                    items
                 } else {
                     vec![(role, message.content.clone())]
                 }
@@ -856,44 +855,54 @@ fn approximate_tokens(text: &str) -> usize {
     (text.chars().count() / 4).max(1)
 }
 
-fn split_thinking(content: &str) -> Vec<(String, String)> {
-    let mut parts = Vec::new();
+fn split_thinking(content: &str) -> (String, String) {
+    let mut thinking = String::new();
+    let mut assistant = String::new();
     let mut rest = content;
 
     loop {
         let Some(start) = rest.find("<think>") else {
             if !rest.trim().is_empty() {
-                parts.push(("assistant".to_string(), rest.trim().to_string()));
+                if !assistant.is_empty() {
+                    assistant.push('\n');
+                }
+                assistant.push_str(rest.trim());
             }
             break;
         };
 
         let before = &rest[..start];
         if !before.trim().is_empty() {
-            parts.push(("assistant".to_string(), before.trim().to_string()));
+            if !assistant.is_empty() {
+                assistant.push('\n');
+            }
+            assistant.push_str(before.trim());
         }
 
         let thinking_start = start + "<think>".len();
         if let Some(end) = rest[thinking_start..].find("</think>") {
             let thinking_end = thinking_start + end;
-            let thinking = &rest[thinking_start..thinking_end];
-            if !thinking.trim().is_empty() {
-                parts.push(("thinking".to_string(), thinking.trim().to_string()));
+            let block = rest[thinking_start..thinking_end].trim();
+            if !block.is_empty() {
+                if !thinking.is_empty() {
+                    thinking.push('\n');
+                }
+                thinking.push_str(block);
             }
             rest = &rest[thinking_end + "</think>".len()..];
         } else {
-            let thinking = &rest[thinking_start..];
-            if !thinking.trim().is_empty() {
-                parts.push(("thinking".to_string(), thinking.trim().to_string()));
+            let block = rest[thinking_start..].trim();
+            if !block.is_empty() {
+                if !thinking.is_empty() {
+                    thinking.push('\n');
+                }
+                thinking.push_str(block);
             }
             break;
         }
     }
 
-    if parts.is_empty() {
-        parts.push(("assistant".to_string(), String::new()));
-    }
-    parts
+    (thinking, assistant)
 }
 
 fn previous_boundary(text: &str, cursor: usize) -> Option<usize> {
@@ -1008,14 +1017,9 @@ mod tests {
 
     #[test]
     fn splits_thinking_blocks_for_display() {
-        let parts = split_thinking("<think>checking files</think>\nDone.");
-        assert_eq!(
-            parts,
-            vec![
-                ("thinking".to_string(), "checking files".to_string()),
-                ("assistant".to_string(), "Done.".to_string())
-            ]
-        );
+        let (thinking, assistant) = split_thinking("<think>checking files</think>\nDone.");
+        assert_eq!(thinking, "checking files");
+        assert_eq!(assistant, "Done.");
     }
 
     #[test]
