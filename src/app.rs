@@ -52,7 +52,7 @@ pub struct App {
     pub rx: mpsc::UnboundedReceiver<AppEvent>,
     messages: Vec<ChatMessage>,
     tool_specs: Vec<OllamaToolSpec>,
-    active_prompt: Option<String>,
+    pending_user_prompts: Vec<String>,
     tool_rounds: usize,
     last_tool_signature: Option<String>,
     pending_assistant: String,
@@ -151,7 +151,7 @@ impl App {
             tools,
             models: Vec::new(),
             tool_specs: standard_tools(),
-            active_prompt: None,
+            pending_user_prompts: Vec::new(),
             tool_rounds: 0,
             last_tool_signature: None,
             input: String::new(),
@@ -382,10 +382,6 @@ impl App {
     }
 
     pub fn submit_prompt(&mut self) {
-        if self.busy {
-            self.status = "Wait for the current request to finish".to_string();
-            return;
-        }
         if self.complete_selected_command() {
             return;
         }
@@ -409,13 +405,25 @@ impl App {
             return;
         }
 
+        if self.busy {
+            self.pending_user_prompts.push(prompt.clone());
+            self.status = format!(
+                "Queued prompt. It will send after the current task finishes ({} queued).",
+                self.pending_user_prompts.len()
+            );
+            return;
+        }
+
         let Some(model) = self.selected_model.clone() else {
             self.status = "Select an Ollama model first".to_string();
             return;
         };
 
+        self.start_user_prompt(model, prompt);
+    }
+
+    fn start_user_prompt(&mut self, model: String, prompt: String) {
         self.push_transcript("user", prompt.clone());
-        self.active_prompt = Some(prompt.clone());
         self.tool_rounds = 0;
         self.last_tool_signature = None;
         self.messages.push(ChatMessage {
@@ -517,6 +525,7 @@ impl App {
                             "system",
                             "Stopped because the model kept requesting tools. Rephrase the request or ask for a narrower step.".to_string(),
                         );
+                        self.maybe_start_queued_prompt();
                         return;
                     }
                     if self
@@ -532,6 +541,7 @@ impl App {
                             "system",
                             "Stopped because the model repeated the same tool call with the same arguments. Please restate the task or give a new constraint.".to_string(),
                         );
+                        self.maybe_start_queued_prompt();
                         return;
                     }
                     self.last_tool_signature = Some(signature);
@@ -573,6 +583,7 @@ impl App {
                 } else {
                     self.busy = false;
                     self.status = "Assistant response complete".to_string();
+                    self.maybe_start_queued_prompt();
                 }
             }
             AppEvent::AssistantDone(Err(error)) => {
@@ -585,6 +596,7 @@ impl App {
                         item.content = self.status.clone();
                     }
                 }
+                self.maybe_start_queued_prompt();
             }
             AppEvent::ToolDone(messages) => {
                 for message in messages {
@@ -598,13 +610,13 @@ impl App {
                 }
                 self.save_conversation();
                 if let Some(model) = self.selected_model.clone() {
-                    self.append_working_prompt();
                     self.start_chat(model);
                 } else {
                     self.busy = false;
                     self.response_start = None;
                     self.stream_role = None;
                     self.status = "No model selected for tool follow-up".to_string();
+                    self.maybe_start_queued_prompt();
                 }
             }
             AppEvent::CommandDone(content) => {
@@ -642,25 +654,18 @@ impl App {
         }
     }
 
-    fn append_working_prompt(&mut self) {
-        let Some(original_prompt) = self.active_prompt.clone() else {
+    fn maybe_start_queued_prompt(&mut self) {
+        if self.busy {
+            return;
+        }
+        let Some(model) = self.selected_model.clone() else {
             return;
         };
-
-        let reminder = format!(
-            "Original user request:\n{}\n\nYou are still working on the same task. Use the tool results above to advance the request. Do not repeat the same tool call or the same arguments. If you already have enough information, answer the user directly instead of calling another tool.",
-            original_prompt
-        );
-
-        self.messages.push(ChatMessage {
-            role: "user".to_string(),
-            content: reminder.clone(),
-            thinking: None,
-            tool_calls: Vec::new(),
-            tool_name: None,
-        });
-        self.push_transcript("user", reminder);
-        self.save_conversation();
+        let Some(prompt) = self.pending_user_prompts.first().cloned() else {
+            return;
+        };
+        self.pending_user_prompts.remove(0);
+        self.start_user_prompt(model, prompt);
     }
 
     fn append_stream_delta(&mut self, role: &str, delta: String) {
@@ -704,7 +709,7 @@ impl App {
             "/clear" => {
                 self.transcript.clear();
                 self.messages.truncate(1);
-                self.active_prompt = None;
+                self.pending_user_prompts.clear();
                 self.tool_rounds = 0;
                 self.last_tool_signature = None;
                 let _ = ConversationState::clear(&self.cwd);
@@ -1202,7 +1207,7 @@ mod tests {
             tx,
             rx,
             messages: vec![system_prompt(None)],
-            active_prompt: None,
+            pending_user_prompts: Vec::new(),
             tool_rounds: 0,
             last_tool_signature: None,
             pending_assistant: String::new(),
