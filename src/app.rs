@@ -6,6 +6,7 @@ use crate::{
 };
 use anyhow::Result;
 use chrono::{DateTime, Local};
+use serde_json::Value;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
@@ -157,6 +158,20 @@ impl App {
             stream_role: None,
             agents_md,
         };
+        app.messages = app
+            .messages
+            .into_iter()
+            .map(|message| {
+                if message.role == "assistant" {
+                    ChatMessage {
+                        role: message.role,
+                        content: normalize_assistant_content(&message.content),
+                    }
+                } else {
+                    message
+                }
+            })
+            .collect();
         app.restore_transcript_from_messages();
         app.refresh_models();
         app.report_agents_status();
@@ -460,6 +475,7 @@ impl App {
             AppEvent::AssistantDone(Ok(content)) => {
                 self.busy = false;
                 self.stream_role = None;
+                let content = normalize_assistant_content(&content);
                 self.messages.push(ChatMessage {
                     role: "assistant".to_string(),
                     content: content.clone(),
@@ -906,7 +922,8 @@ fn split_thinking(content: &str) -> (String, String) {
 }
 
 fn assistant_display_parts(content: &str) -> (String, String) {
-    let (thinking, assistant) = split_thinking(content);
+    let content = normalize_assistant_content(content);
+    let (thinking, assistant) = split_thinking(&content);
     if assistant.trim().is_empty() {
         return (thinking, assistant);
     }
@@ -915,6 +932,45 @@ fn assistant_display_parts(content: &str) -> (String, String) {
         Ok(Some(call)) => (thinking, format!("Requested tool: {}", call.summary())),
         _ => (thinking, assistant),
     }
+}
+
+fn normalize_assistant_content(content: &str) -> String {
+    let trimmed = content.trim();
+    let Some(value) = serde_json::from_str::<Value>(trimmed).ok() else {
+        return content.to_string();
+    };
+
+    let Some(object) = value.as_object() else {
+        return content.to_string();
+    };
+
+    let response_text = object
+        .get("response_text")
+        .or_else(|| object.get("content"))
+        .or_else(|| object.get("text"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+
+    let looks_like_wrapper = object.contains_key("response_text")
+        && [
+            "completing",
+            "next_steps_content",
+            "required",
+            "concise",
+            "concise_reasoning",
+            "concise_percentage",
+        ]
+        .iter()
+        .any(|key| object.contains_key(*key));
+
+    if looks_like_wrapper {
+        if let Some(text) = response_text {
+            return text.to_string();
+        }
+    }
+
+    content.to_string()
 }
 
 fn previous_boundary(text: &str, cursor: usize) -> Option<usize> {
@@ -1040,6 +1096,14 @@ mod tests {
             assistant_display_parts("{\"tool\":\"bash\",\"command\":\"cargo check\"}");
         assert!(thinking.is_empty());
         assert_eq!(assistant, "Requested tool: bash cargo check");
+    }
+
+    #[test]
+    fn unwraps_response_text_wrapper() {
+        let content = normalize_assistant_content(
+            "{\"completing\":true,\"response_text\":\"Great, that test passed.\",\"next_steps_content\":\"\",\"required\":false,\"concise\":true,\"concise_reasoning\":true,\"concise_percentage\":0.5}",
+        );
+        assert_eq!(content, "Great, that test passed.");
     }
 
     #[test]
