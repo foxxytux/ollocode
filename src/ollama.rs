@@ -73,8 +73,10 @@ pub struct OllamaToolFunction {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OllamaToolCall {
-    #[serde(rename = "type")]
-    pub kind: String,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default, rename = "type")]
+    pub kind: Option<String>,
     pub function: OllamaToolCallFunction,
 }
 

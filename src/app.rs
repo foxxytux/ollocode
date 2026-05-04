@@ -1054,12 +1054,16 @@ fn normalize_display_segment(content: &str) -> String {
 }
 
 fn local_tool_call(call: &OllamaToolCall) -> anyhow::Result<ToolCall> {
-    let mut object = call
-        .function
-        .arguments
-        .as_object()
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("tool call arguments must be a JSON object"))?;
+    let mut object = if let Some(object) = call.function.arguments.as_object() {
+        object.clone()
+    } else if let Some(text) = call.function.arguments.as_str() {
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(text)
+            .map_err(|error| anyhow::anyhow!("tool call arguments must be valid JSON: {error}"))?
+    } else {
+        return Err(anyhow::anyhow!(
+            "tool call arguments must be a JSON object or JSON string"
+        ));
+    };
     object.insert(
         "tool".to_string(),
         serde_json::Value::String(call.function.name.clone()),
