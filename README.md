@@ -13,6 +13,7 @@ cargo run
 The app reads models from Ollama's local API and lets you switch models in the TUI.
 Conversation context is restored per workspace, and the header shows an approximate context-window percentage for the selected model.
 Model output wrapped in `<think>...</think>` is shown in the transcript as `thinking`.
+Only models that advertise native Ollama tool support are shown and selectable.
 
 ## Install
 
@@ -61,15 +62,8 @@ Command suggestions appear only while typing `/` commands.
 
 ## Tool Calls
 
-The model can request local tools by emitting one standalone JSON object:
-
-```json
-{"tool":"read","path":"src/main.rs"}
-```
-
-Do not wrap tool calls in markdown fences.
-
-Supported model tools:
+Ollama tool-capable models can call local tools through the native `/api/chat` `tools` field.
+Supported tools:
 
 - `bash`
 - `read`
@@ -78,6 +72,9 @@ Supported model tools:
 - `list`
 - `search`
 - `patch`
+
+The app passes those tools directly to Ollama and only keeps models that report tool support in `/api/show`.
+Tool results are fed back to the model as native `tool` messages.
 
 Tools run from the workspace root. File paths are restricted to the workspace.
 Use one tool call at a time.

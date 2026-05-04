@@ -1,7 +1,10 @@
 use crate::{
     agents,
     config::{Config, ConversationState},
-    ollama::{ChatDelta, ChatMessage, Model, OllamaClient, system_prompt},
+    ollama::{
+        ChatDelta, ChatMessage, Model, OllamaClient, OllamaToolCall, OllamaToolSpec,
+        assistant_tool_call_summary, standard_tools, system_prompt,
+    },
     tools::{ToolCall, ToolRunner, extract_tool_call},
 };
 use anyhow::Result;
@@ -22,8 +25,8 @@ pub enum AppEvent {
     ModelsLoaded(Result<Vec<Model>, String>),
     AssistantDelta(String),
     AssistantThinkingDelta(String),
-    AssistantDone(Result<String, String>),
-    ToolDone(String),
+    AssistantDone(Result<ChatMessage, String>),
+    ToolDone(Vec<ChatMessage>),
     CommandDone(String),
 }
 
@@ -46,6 +49,7 @@ pub struct App {
     pub tx: mpsc::UnboundedSender<AppEvent>,
     pub rx: mpsc::UnboundedReceiver<AppEvent>,
     messages: Vec<ChatMessage>,
+    tool_specs: Vec<OllamaToolSpec>,
     pending_assistant: String,
     response_start: Option<usize>,
     stream_role: Option<String>,
@@ -141,6 +145,7 @@ impl App {
             client,
             tools,
             models: Vec::new(),
+            tool_specs: standard_tools(),
             input: String::new(),
             input_cursor: 0,
             command_cursor: 0,
@@ -166,6 +171,9 @@ impl App {
                     ChatMessage {
                         role: message.role,
                         content: normalize_assistant_content(&message.content),
+                        thinking: message.thinking,
+                        tool_calls: message.tool_calls,
+                        tool_name: message.tool_name,
                     }
                 } else {
                     message
@@ -402,6 +410,9 @@ impl App {
         self.messages.push(ChatMessage {
             role: "user".to_string(),
             content: prompt,
+            thinking: None,
+            tool_calls: Vec::new(),
+            tool_name: None,
         });
         self.save_conversation();
         self.start_chat(model);
@@ -416,12 +427,13 @@ impl App {
         self.status = format!("Streaming from {model}");
         let client = self.client.clone();
         let messages = self.messages.clone();
+        let tools = self.tool_specs.clone();
         let tx = self.tx.clone();
 
         tokio::spawn(async move {
             let tx_delta = tx.clone();
             let result = client
-                .chat_stream(&model, &messages, move |delta| {
+                .chat_stream(&model, &messages, &tools, move |delta| {
                     let event = match delta {
                         ChatDelta::Content(content) => AppEvent::AssistantDelta(content),
                         ChatDelta::Thinking(thinking) => AppEvent::AssistantThinkingDelta(thinking),
@@ -445,7 +457,7 @@ impl App {
             AppEvent::ModelsLoaded(Ok(models)) => {
                 self.models = models;
                 if self.models.is_empty() {
-                    self.status = "No Ollama models found. Run `ollama pull <model>`.".to_string();
+                    self.status = "No Ollama models with tool support found.".to_string();
                     self.selected_model = None;
                 } else if self
                     .selected_model
@@ -457,7 +469,8 @@ impl App {
                     let _ = self.config.save();
                     self.status = format!("Selected {}", self.models[0].name);
                 } else {
-                    self.status = format!("Loaded {} Ollama models", self.models.len());
+                    self.status =
+                        format!("Loaded {} tool-capable Ollama models", self.models.len());
                 }
             }
             AppEvent::ModelsLoaded(Err(error)) => {
@@ -472,34 +485,51 @@ impl App {
                 self.transcript_scroll = 0;
                 self.append_stream_delta("thinking", delta);
             }
-            AppEvent::AssistantDone(Ok(content)) => {
-                self.busy = false;
+            AppEvent::AssistantDone(Ok(message)) => {
                 self.stream_role = None;
-                let content = normalize_assistant_content(&content);
-                self.messages.push(ChatMessage {
-                    role: "assistant".to_string(),
-                    content: content.clone(),
-                });
+                self.messages.push(message.clone());
                 self.save_conversation();
-                self.replace_latest_assistant_with_parts(&content);
-                self.status = "Assistant response complete".to_string();
+                self.replace_latest_assistant_with_message(&message);
 
-                match extract_tool_call(&content) {
-                    Ok(Some(call)) => {
-                        self.status = "Running requested tool".to_string();
-                        let tools = self.tools.clone();
-                        let tx = self.tx.clone();
-                        tokio::spawn(async move {
-                            let result = tools.run(call).await;
-                            let content = serde_json::to_string_pretty(&result)
-                                .unwrap_or_else(|_| "{\"ok\":false}".to_string());
-                            let _ = tx.send(AppEvent::ToolDone(content));
-                        });
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        self.status = format!("Tool parse error: {error:#}");
-                    }
+                if !message.tool_calls.is_empty() {
+                    self.status = format!(
+                        "Running {}",
+                        if message.tool_calls.len() == 1 {
+                            "requested tool".to_string()
+                        } else {
+                            format!("{} requested tools", message.tool_calls.len())
+                        }
+                    );
+                    let tools = self.tools.clone();
+                    let tool_calls = message.tool_calls.clone();
+                    let tx = self.tx.clone();
+                    tokio::spawn(async move {
+                        let mut results = Vec::new();
+                        for call in tool_calls {
+                            let result = match local_tool_call(&call) {
+                                Ok(tool_call) => tools.run(tool_call).await,
+                                Err(error) => crate::tools::ToolResult {
+                                    ok: false,
+                                    output: format!("{error:#}"),
+                                },
+                            };
+                            results.push(ChatMessage {
+                                role: "tool".to_string(),
+                                content: format!(
+                                    "status: {}\n{}",
+                                    if result.ok { "ok" } else { "error" },
+                                    result.output
+                                ),
+                                thinking: None,
+                                tool_calls: Vec::new(),
+                                tool_name: Some(call.function.name.clone()),
+                            });
+                        }
+                        let _ = tx.send(AppEvent::ToolDone(results));
+                    });
+                } else {
+                    self.busy = false;
+                    self.status = "Assistant response complete".to_string();
                 }
             }
             AppEvent::AssistantDone(Err(error)) => {
@@ -513,17 +543,22 @@ impl App {
                     }
                 }
             }
-            AppEvent::ToolDone(content) => {
-                self.push_transcript("tool", content.clone());
-                self.messages.push(ChatMessage {
-                    role: "user".to_string(),
-                    content: format!(
-                        "Tool result for your previous tool call:\n{content}\nContinue from this result. If ok is false, recover by using another supported tool or explain the failure."
-                    ),
-                });
+            AppEvent::ToolDone(messages) => {
+                for message in messages {
+                    let role = if message.role == "tool" {
+                        "tool"
+                    } else {
+                        message.role.as_str()
+                    };
+                    self.push_transcript(role, message.content.clone());
+                    self.messages.push(message);
+                }
                 self.save_conversation();
                 if let Some(model) = self.selected_model.clone() {
                     self.start_chat(model);
+                } else {
+                    self.busy = false;
+                    self.status = "No model selected for tool follow-up".to_string();
                 }
             }
             AppEvent::CommandDone(content) => {
@@ -546,8 +581,8 @@ impl App {
         });
     }
 
-    fn replace_latest_assistant_with_parts(&mut self, content: &str) {
-        let (thinking, assistant) = assistant_display_parts(content);
+    fn replace_latest_assistant_with_message(&mut self, message: &ChatMessage) {
+        let (thinking, assistant) = assistant_message_display_parts(message);
         if let Some(start) = self.response_start.take() {
             self.transcript.truncate(start);
         } else if matches!(self.transcript.last(), Some(item) if item.role == "assistant") {
@@ -631,7 +666,7 @@ impl App {
 
     fn command_tools(&self) -> String {
         [
-            "Model tools:",
+            "Native Ollama tools:",
             "bash { command } - run a shell command",
             "read { path } - read a file",
             "write { path, content } - write a full file",
@@ -641,6 +676,7 @@ impl App {
             "patch { patch } - apply an apply_patch-style patch",
             "",
             "Core tools guaranteed here: bash, read, write, edit.",
+            "Only Ollama models that advertise tool support are shown and selectable.",
         ]
         .join("\n")
     }
@@ -680,7 +716,8 @@ impl App {
 
     fn command_models(&self) -> String {
         if self.models.is_empty() {
-            return "No models loaded. Run Ctrl+M to refresh Ollama models.".to_string();
+            return "No tool-capable models loaded. Run Ctrl+M to refresh Ollama models."
+                .to_string();
         }
         self.models
             .iter()
@@ -798,16 +835,8 @@ impl App {
             .iter()
             .filter(|message| message.role != "system")
             .flat_map(|message| {
-                let role = if message
-                    .content
-                    .starts_with("Tool result for your previous tool call:")
-                {
-                    "tool".to_string()
-                } else {
-                    message.role.clone()
-                };
-                if role == "assistant" {
-                    let (thinking, assistant) = assistant_display_parts(&message.content);
+                if message.role == "assistant" {
+                    let (thinking, assistant) = assistant_message_display_parts(message);
                     let mut items = Vec::new();
                     if !thinking.trim().is_empty() {
                         items.push(("thinking".to_string(), thinking));
@@ -816,8 +845,10 @@ impl App {
                         items.push(("assistant".to_string(), assistant));
                     }
                     items
+                } else if message.role == "tool" {
+                    vec![("tool".to_string(), message.content.clone())]
                 } else {
-                    vec![(role, message.content.clone())]
+                    vec![(message.role.clone(), message.content.clone())]
                 }
             })
             .collect();
@@ -836,7 +867,14 @@ impl App {
     fn approx_context_tokens(&self) -> usize {
         self.messages
             .iter()
-            .map(|message| approximate_tokens(&message.content) + 4)
+            .map(|message| {
+                let thinking = message.thinking.as_deref().unwrap_or_default();
+                let tool_calls = serde_json::to_string(&message.tool_calls).unwrap_or_default();
+                approximate_tokens(&message.content)
+                    + approximate_tokens(thinking)
+                    + approximate_tokens(&tool_calls)
+                    + 4
+            })
             .sum()
     }
 
@@ -871,6 +909,7 @@ fn approximate_tokens(text: &str) -> usize {
     (text.chars().count() / 4).max(1)
 }
 
+#[cfg(test)]
 fn split_thinking(content: &str) -> (String, String) {
     let mut thinking = String::new();
     let mut assistant = String::new();
@@ -921,6 +960,7 @@ fn split_thinking(content: &str) -> (String, String) {
     (thinking, assistant)
 }
 
+#[cfg(test)]
 fn assistant_display_parts(content: &str) -> (String, String) {
     let content = normalize_assistant_content(content);
     let (thinking, assistant) = split_thinking(&content);
@@ -934,6 +974,29 @@ fn assistant_display_parts(content: &str) -> (String, String) {
         Ok(Some(call)) => (thinking, format!("Requested tool: {}", call.summary())),
         _ => (thinking, assistant),
     }
+}
+
+fn assistant_message_display_parts(message: &ChatMessage) -> (String, String) {
+    let thinking = message.thinking.clone().unwrap_or_default();
+    let assistant = if message.tool_calls.is_empty() {
+        normalize_assistant_content(&message.content)
+    } else {
+        let summary = assistant_tool_call_summary(&message.tool_calls);
+        if message.content.trim().is_empty() {
+            summary
+        } else if summary.is_empty() {
+            message.content.clone()
+        } else {
+            format!(
+                "{}\n{}",
+                normalize_assistant_content(&message.content),
+                summary
+            )
+        }
+    };
+    let thinking = normalize_display_segment(&thinking);
+    let assistant = normalize_display_segment(&assistant);
+    (thinking, assistant)
 }
 
 fn normalize_assistant_content(content: &str) -> String {
@@ -990,6 +1053,21 @@ fn normalize_display_segment(content: &str) -> String {
     content.to_string()
 }
 
+fn local_tool_call(call: &OllamaToolCall) -> anyhow::Result<ToolCall> {
+    let mut object = call
+        .function
+        .arguments
+        .as_object()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("tool call arguments must be a JSON object"))?;
+    object.insert(
+        "tool".to_string(),
+        serde_json::Value::String(call.function.name.clone()),
+    );
+    serde_json::from_value(serde_json::Value::Object(object))
+        .map_err(|error| anyhow::anyhow!(error))
+}
+
 fn previous_boundary(text: &str, cursor: usize) -> Option<usize> {
     if cursor == 0 {
         return None;
@@ -1022,6 +1100,7 @@ mod tests {
             client: OllamaClient::new("http://127.0.0.1:11434".to_string()),
             tools: ToolRunner::new(cwd),
             models: Vec::new(),
+            tool_specs: standard_tools(),
             input: String::new(),
             input_cursor: 0,
             command_cursor: 0,
@@ -1090,10 +1169,14 @@ mod tests {
             size: None,
             modified_at: None,
             details: None,
+            capabilities: Vec::new(),
         }];
         app.messages.push(ChatMessage {
             role: "user".to_string(),
             content: "hello".repeat(100),
+            thinking: None,
+            tool_calls: Vec::new(),
+            tool_name: None,
         });
 
         assert!(app.context_percent().is_some());

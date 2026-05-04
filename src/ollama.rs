@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
-use futures_util::StreamExt;
+use futures_util::{StreamExt, future::join_all};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone)]
 pub struct OllamaClient {
@@ -14,6 +15,16 @@ pub struct Model {
     pub size: Option<u64>,
     pub modified_at: Option<String>,
     pub details: Option<ModelDetails>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+impl Model {
+    pub fn supports_tools(&self) -> bool {
+        self.capabilities.iter().any(|capability| {
+            capability.eq_ignore_ascii_case("tools") || capability.contains("tool")
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -27,10 +38,52 @@ struct TagsResponse {
     models: Vec<Model>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ShowResponse {
+    #[serde(default)]
+    capabilities: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatMessage {
     pub role: String,
+    #[serde(default)]
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<OllamaToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OllamaToolSpec {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: OllamaToolFunction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OllamaToolFunction {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OllamaToolCall {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: OllamaToolCallFunction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OllamaToolCallFunction {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<u64>,
+    pub name: String,
+    pub arguments: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,21 +96,16 @@ pub enum ChatDelta {
 struct ChatRequest<'a> {
     model: &'a str,
     messages: &'a [ChatMessage],
+    tools: &'a [OllamaToolSpec],
+    think: bool,
     stream: bool,
 }
 
 #[derive(Debug, Deserialize)]
 struct ChatChunk {
-    message: Option<ChunkMessage>,
-    response: Option<String>,
+    message: Option<ChatMessage>,
     done: bool,
     error: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChunkMessage {
-    content: Option<String>,
-    thinking: Option<String>,
 }
 
 impl OllamaClient {
@@ -79,16 +127,56 @@ impl OllamaClient {
             .error_for_status()
             .context("Ollama returned an error while listing models")?;
         let mut models = response.json::<TagsResponse>().await?.models;
+
+        let client = self.clone();
+        let capability_futures = models.iter().map(move |model| {
+            let client = client.clone();
+            let name = model.name.clone();
+            async move {
+                let capabilities = client
+                    .show_model_capabilities(&name)
+                    .await
+                    .unwrap_or_default();
+                (name, capabilities)
+            }
+        });
+        let capabilities = join_all(capability_futures).await;
+
+        for model in &mut models {
+            if let Some((_, capability_list)) =
+                capabilities.iter().find(|(name, _)| name == &model.name)
+            {
+                model.capabilities = capability_list.clone();
+            }
+        }
+
+        models.retain(Model::supports_tools);
         models.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(models)
+    }
+
+    async fn show_model_capabilities(&self, model: &str) -> Result<Vec<String>> {
+        let url = format!("{}/api/show", self.base_url);
+        let response = self
+            .http
+            .post(url)
+            .json(&serde_json::json!({ "model": model }))
+            .send()
+            .await
+            .context("failed to connect to Ollama")?
+            .error_for_status()
+            .context("Ollama returned an error while loading model details")?;
+        let response = response.json::<ShowResponse>().await?;
+        Ok(response.capabilities)
     }
 
     pub async fn chat_stream<F>(
         &self,
         model: &str,
         messages: &[ChatMessage],
+        tools: &[OllamaToolSpec],
         mut on_delta: F,
-    ) -> Result<String>
+    ) -> Result<ChatMessage>
     where
         F: FnMut(ChatDelta) + Send,
     {
@@ -100,6 +188,8 @@ impl OllamaClient {
         let request = ChatRequest {
             model,
             messages,
+            tools,
+            think: true,
             stream: true,
         };
         let response = self
@@ -114,8 +204,9 @@ impl OllamaClient {
 
         let mut stream = response.bytes_stream();
         let mut pending = String::new();
-        let mut full = String::new();
-        let mut thinking_open = false;
+        let mut content = String::new();
+        let mut thinking = String::new();
+        let mut tool_calls = Vec::new();
 
         while let Some(chunk) = stream.next().await {
             let bytes = chunk.context("failed to read Ollama stream")?;
@@ -134,35 +225,30 @@ impl OllamaClient {
                     bail!(error);
                 }
                 if let Some(message) = chunk.message {
-                    if let Some(thinking) = message.thinking.filter(|value| !value.is_empty()) {
-                        on_delta(ChatDelta::Thinking(thinking.clone()));
-                        if !thinking_open {
-                            full.push_str("<think>");
-                            thinking_open = true;
-                        }
-                        full.push_str(&thinking);
+                    if let Some(delta) = message.thinking.filter(|value| !value.is_empty()) {
+                        thinking.push_str(&delta);
+                        on_delta(ChatDelta::Thinking(delta));
                     }
-                    if let Some(content) = message.content.filter(|value| !value.is_empty()) {
-                        if thinking_open {
-                            full.push_str("</think>");
-                            thinking_open = false;
-                        }
-                        on_delta(ChatDelta::Content(content.clone()));
-                        full.push_str(&content);
+                    if !message.content.is_empty() {
+                        content.push_str(&message.content);
+                        on_delta(ChatDelta::Content(message.content));
                     }
-                } else if let Some(delta) = chunk.response.filter(|value| !value.is_empty()) {
-                    if thinking_open {
-                        full.push_str("</think>");
-                        thinking_open = false;
+                    if !message.tool_calls.is_empty() {
+                        tool_calls.extend(message.tool_calls);
                     }
-                    on_delta(ChatDelta::Content(delta.clone()));
-                    full.push_str(&delta);
                 }
                 if chunk.done {
-                    if thinking_open {
-                        full.push_str("</think>");
-                    }
-                    return Ok(full);
+                    return Ok(ChatMessage {
+                        role: "assistant".to_string(),
+                        content,
+                        thinking: if thinking.is_empty() {
+                            None
+                        } else {
+                            Some(thinking)
+                        },
+                        tool_calls,
+                        tool_name: None,
+                    });
                 }
             }
         }
@@ -174,38 +260,191 @@ impl OllamaClient {
                 bail!(error);
             }
             if let Some(message) = chunk.message {
-                if let Some(thinking) = message.thinking.filter(|value| !value.is_empty()) {
-                    on_delta(ChatDelta::Thinking(thinking.clone()));
-                    if !thinking_open {
-                        full.push_str("<think>");
-                        thinking_open = true;
-                    }
-                    full.push_str(&thinking);
+                if let Some(delta) = message.thinking.filter(|value| !value.is_empty()) {
+                    thinking.push_str(&delta);
+                    on_delta(ChatDelta::Thinking(delta));
                 }
-                if let Some(content) = message.content.filter(|value| !value.is_empty()) {
-                    if thinking_open {
-                        full.push_str("</think>");
-                        thinking_open = false;
-                    }
-                    on_delta(ChatDelta::Content(content.clone()));
-                    full.push_str(&content);
+                if !message.content.is_empty() {
+                    content.push_str(&message.content);
+                    on_delta(ChatDelta::Content(message.content));
                 }
-            } else if let Some(delta) = chunk.response.filter(|value| !value.is_empty()) {
-                if thinking_open {
-                    full.push_str("</think>");
-                    thinking_open = false;
+                if !message.tool_calls.is_empty() {
+                    tool_calls.extend(message.tool_calls);
                 }
-                on_delta(ChatDelta::Content(delta.clone()));
-                full.push_str(&delta);
             }
         }
 
-        if thinking_open {
-            full.push_str("</think>");
-        }
-
-        Ok(full)
+        Ok(ChatMessage {
+            role: "assistant".to_string(),
+            content,
+            thinking: if thinking.is_empty() {
+                None
+            } else {
+                Some(thinking)
+            },
+            tool_calls,
+            tool_name: None,
+        })
     }
+}
+
+pub fn assistant_tool_call_summary(tool_calls: &[OllamaToolCall]) -> String {
+    if tool_calls.is_empty() {
+        return String::new();
+    }
+
+    tool_calls
+        .iter()
+        .map(|call| {
+            let arguments = if call.function.arguments.is_null() {
+                String::new()
+            } else {
+                format!(" {}", call.function.arguments)
+            };
+            format!("Requested tool: {}{}", call.function.name, arguments)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub fn standard_tools() -> Vec<OllamaToolSpec> {
+    vec![
+        OllamaToolSpec {
+            kind: "function".to_string(),
+            function: OllamaToolFunction {
+                name: "bash".to_string(),
+                description: "Run a shell command in the workspace root.".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "required": ["command"],
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "Shell command to run"
+                        }
+                    }
+                }),
+            },
+        },
+        OllamaToolSpec {
+            kind: "function".to_string(),
+            function: OllamaToolFunction {
+                name: "read".to_string(),
+                description: "Read a file or list a directory in the workspace.".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "required": ["path"],
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Workspace-relative file or directory path"
+                        }
+                    }
+                }),
+            },
+        },
+        OllamaToolSpec {
+            kind: "function".to_string(),
+            function: OllamaToolFunction {
+                name: "write".to_string(),
+                description: "Write full file contents to a workspace path.".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "required": ["path", "content"],
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Workspace-relative file path"
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "Full file content to write"
+                        }
+                    }
+                }),
+            },
+        },
+        OllamaToolSpec {
+            kind: "function".to_string(),
+            function: OllamaToolFunction {
+                name: "edit".to_string(),
+                description: "Replace exact text once in a workspace file.".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "required": ["path", "old", "new"],
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Workspace-relative file path"
+                        },
+                        "old": {
+                            "type": "string",
+                            "description": "Exact text to replace"
+                        },
+                        "new": {
+                            "type": "string",
+                            "description": "Replacement text"
+                        }
+                    }
+                }),
+            },
+        },
+        OllamaToolSpec {
+            kind: "function".to_string(),
+            function: OllamaToolFunction {
+                name: "list".to_string(),
+                description: "List the contents of a directory in the workspace.".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "required": ["path"],
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Workspace-relative directory path"
+                        }
+                    }
+                }),
+            },
+        },
+        OllamaToolSpec {
+            kind: "function".to_string(),
+            function: OllamaToolFunction {
+                name: "search".to_string(),
+                description: "Search for text in the workspace with ripgrep.".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "required": ["query"],
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query"
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Optional workspace-relative path to limit the search"
+                        }
+                    }
+                }),
+            },
+        },
+        OllamaToolSpec {
+            kind: "function".to_string(),
+            function: OllamaToolFunction {
+                name: "patch".to_string(),
+                description: "Apply an apply_patch-style patch.".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "required": ["patch"],
+                    "properties": {
+                        "patch": {
+                            "type": "string",
+                            "description": "Patch text in apply_patch format"
+                        }
+                    }
+                }),
+            },
+        },
+    ]
 }
 
 pub fn system_prompt(agents_md: Option<&str>) -> ChatMessage {
@@ -226,29 +465,16 @@ pub fn system_prompt(agents_md: Option<&str>) -> ChatMessage {
             let mut prompt = r#"You are ollo-code, a local autonomous coding agent running in a terminal.
 
 The full conversation history in this chat is your memory. Use previous user and assistant messages when answering. If the user asks what they just said or refers to earlier messages, answer from the messages already in this conversation instead of claiming you cannot remember.
-Do not output evaluation JSON, benchmark metadata, or self-critique wrappers. Reply in plain language unless you are emitting a tool call.
-
-You may inspect and modify files by emitting exactly one standalone JSON tool call when a tool is needed.
-Do not wrap the tool call in Markdown fences.
-After a tool result is returned, continue from the result. Tool results are real even when ok is false. Do not claim a supported tool was unrecognized.
-
-Tool call format:
-{"tool":"read","path":"src/main.rs"}
-
-Supported tools:
-- bash: {"tool":"bash","command":"cargo check"}
-- read: {"tool":"read","path":"relative/path"}
-- write: {"tool":"write","path":"relative/path","content":"full file content"}
-- edit: {"tool":"edit","path":"relative/path","old":"exact old text","new":"replacement text"}
-- list: {"tool":"list","path":"."}
-- search: {"tool":"search","query":"symbol or text","path":"optional/path"}
-- patch: {"tool":"patch","patch":"*** Begin Patch\n..."}
-
-The required core tools are bash, read, write, and edit. Prefer read before edit/write. Use search before broad reads. Keep changes focused.
-Use only one tool per assistant response."#
-                .to_string();
+Do not output evaluation JSON, benchmark metadata, or self-critique wrappers. Reply in plain language unless you are emitting a tool response.
+Use the provided native tools when you need to inspect or change the workspace. Do not invent your own tool syntax in assistant content.
+Prefer the smallest useful tool call, and continue from tool results until the task is complete.
+"#
+            .to_string();
             prompt.push_str(&agents_section);
             prompt
         },
+        thinking: None,
+        tool_calls: Vec::new(),
+        tool_name: None,
     }
 }
