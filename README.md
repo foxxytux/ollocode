@@ -61,11 +61,13 @@ Command suggestions appear only while typing `/` commands.
 
 ## Tool Calls
 
-The model can request local tools by emitting fenced JSON:
+The model can request local tools by emitting one standalone JSON object:
 
 ```json
 {"tool":"read","path":"src/main.rs"}
 ```
+
+Do not wrap tool calls in markdown fences.
 
 Supported model tools:
 
@@ -78,3 +80,4 @@ Supported model tools:
 - `patch`
 
 Tools run from the workspace root. File paths are restricted to the workspace.
+Use one tool call at a time.

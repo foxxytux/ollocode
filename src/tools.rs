@@ -343,6 +343,23 @@ impl<'de> Deserialize<'de> for ToolCall {
     }
 }
 
+impl ToolCall {
+    pub fn summary(&self) -> String {
+        match self {
+            Self::Bash { command } => format!("bash {command}"),
+            Self::Read { path } => format!("read {path}"),
+            Self::Write { path, .. } => format!("write {path}"),
+            Self::Edit { path, .. } => format!("edit {path}"),
+            Self::List { path } => format!("list {path}"),
+            Self::Search { query, path } => match path {
+                Some(path) if !path.is_empty() => format!("search {query} in {path}"),
+                _ => format!("search {query}"),
+            },
+            Self::Patch { .. } => "patch".to_string(),
+        }
+    }
+}
+
 fn join_patch_lines(lines: &[&str], trailing_newline: bool) -> String {
     let mut text = lines.join("\n");
     if trailing_newline && !text.is_empty() {
@@ -359,6 +376,11 @@ pub fn extract_tool_call(text: &str) -> Result<Option<ToolCall>> {
     }
     if let Ok(call) = serde_json::from_str::<ToolCall>(text.trim()) {
         return Ok(Some(call));
+    }
+    if let Some(block) = first_json_object(text) {
+        if let Ok(call) = serde_json::from_str::<ToolCall>(block) {
+            return Ok(Some(call));
+        }
     }
     Ok(None)
 }
@@ -390,6 +412,45 @@ fn fenced_json_blocks(text: &str) -> Vec<String> {
     blocks
 }
 
+fn first_json_object(text: &str) -> Option<&str> {
+    let mut start = None;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escape = false;
+
+    for (index, ch) in text.char_indices() {
+        if let Some(start_index) = start {
+            if in_string {
+                if escape {
+                    escape = false;
+                } else if ch == '\\' {
+                    escape = true;
+                } else if ch == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+
+            match ch {
+                '"' => in_string = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some(&text[start_index..=index]);
+                    }
+                }
+                _ => {}
+            }
+        } else if ch == '{' {
+            start = Some(index);
+            depth = 1;
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,6 +463,18 @@ mod tests {
             call,
             ToolCall::Read {
                 path: "Cargo.toml".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn extracts_plain_tool_call() {
+        let text = "Please run this tool: {\"tool\":\"bash\",\"command\":\"cargo check\"}";
+        let call = extract_tool_call(text).unwrap().unwrap();
+        assert_eq!(
+            call,
+            ToolCall::Bash {
+                command: "cargo check".to_string()
             }
         );
     }

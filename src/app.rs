@@ -531,7 +531,7 @@ impl App {
     }
 
     fn replace_latest_assistant_with_parts(&mut self, content: &str) {
-        let (thinking, assistant) = split_thinking(content);
+        let (thinking, assistant) = assistant_display_parts(content);
         if let Some(start) = self.response_start.take() {
             self.transcript.truncate(start);
         } else if matches!(self.transcript.last(), Some(item) if item.role == "assistant") {
@@ -791,7 +791,7 @@ impl App {
                     message.role.clone()
                 };
                 if role == "assistant" {
-                    let (thinking, assistant) = split_thinking(&message.content);
+                    let (thinking, assistant) = assistant_display_parts(&message.content);
                     let mut items = Vec::new();
                     if !thinking.trim().is_empty() {
                         items.push(("thinking".to_string(), thinking));
@@ -903,6 +903,18 @@ fn split_thinking(content: &str) -> (String, String) {
     }
 
     (thinking, assistant)
+}
+
+fn assistant_display_parts(content: &str) -> (String, String) {
+    let (thinking, assistant) = split_thinking(content);
+    if assistant.trim().is_empty() {
+        return (thinking, assistant);
+    }
+
+    match extract_tool_call(&assistant) {
+        Ok(Some(call)) => (thinking, format!("Requested tool: {}", call.summary())),
+        _ => (thinking, assistant),
+    }
 }
 
 fn previous_boundary(text: &str, cursor: usize) -> Option<usize> {
@@ -1020,6 +1032,14 @@ mod tests {
         let (thinking, assistant) = split_thinking("<think>checking files</think>\nDone.");
         assert_eq!(thinking, "checking files");
         assert_eq!(assistant, "Done.");
+    }
+
+    #[test]
+    fn summarizes_tool_calls_for_display() {
+        let (thinking, assistant) =
+            assistant_display_parts("{\"tool\":\"bash\",\"command\":\"cargo check\"}");
+        assert!(thinking.is_empty());
+        assert_eq!(assistant, "Requested tool: bash cargo check");
     }
 
     #[test]

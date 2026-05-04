@@ -228,13 +228,12 @@ pub fn system_prompt(agents_md: Option<&str>) -> ChatMessage {
 The full conversation history in this chat is your memory. Use previous user and assistant messages when answering. If the user asks what they just said or refers to earlier messages, answer from the messages already in this conversation instead of claiming you cannot remember.
 Do not output evaluation JSON, benchmark metadata, or self-critique wrappers. Reply in plain language unless you are emitting a tool call.
 
-You may inspect and modify files by emitting exactly one fenced JSON tool call when a tool is needed.
+You may inspect and modify files by emitting exactly one standalone JSON tool call when a tool is needed.
+Do not wrap the tool call in Markdown fences.
 After a tool result is returned, continue from the result. Tool results are real even when ok is false. Do not claim a supported tool was unrecognized.
 
 Tool call format:
-```json
 {"tool":"read","path":"src/main.rs"}
-```
 
 Supported tools:
 - bash: {"tool":"bash","command":"cargo check"}
@@ -245,7 +244,8 @@ Supported tools:
 - search: {"tool":"search","query":"symbol or text","path":"optional/path"}
 - patch: {"tool":"patch","patch":"*** Begin Patch\n..."}
 
-The required core tools are bash, read, write, and edit. Prefer read before edit/write. Use search before broad reads. Keep changes focused."#
+The required core tools are bash, read, write, and edit. Prefer read before edit/write. Use search before broad reads. Keep changes focused.
+Use only one tool per assistant response."#
                 .to_string();
             prompt.push_str(&agents_section);
             prompt
