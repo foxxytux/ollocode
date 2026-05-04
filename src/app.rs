@@ -924,6 +924,8 @@ fn split_thinking(content: &str) -> (String, String) {
 fn assistant_display_parts(content: &str) -> (String, String) {
     let content = normalize_assistant_content(content);
     let (thinking, assistant) = split_thinking(&content);
+    let thinking = normalize_display_segment(&thinking);
+    let assistant = normalize_display_segment(&assistant);
     if assistant.trim().is_empty() {
         return (thinking, assistant);
     }
@@ -936,6 +938,10 @@ fn assistant_display_parts(content: &str) -> (String, String) {
 
 fn normalize_assistant_content(content: &str) -> String {
     let trimmed = content.trim();
+    if let Ok(Some(call)) = extract_tool_call(trimmed) {
+        return format!("Requested tool: {}", call.summary());
+    }
+
     let Some(value) = serde_json::from_str::<Value>(trimmed).ok() else {
         return content.to_string();
     };
@@ -970,6 +976,17 @@ fn normalize_assistant_content(content: &str) -> String {
         }
     }
 
+    content.to_string()
+}
+
+fn normalize_display_segment(content: &str) -> String {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return content.to_string();
+    }
+    if let Ok(Some(call)) = extract_tool_call(trimmed) {
+        return format!("Requested tool: {}", call.summary());
+    }
     content.to_string()
 }
 
@@ -1096,6 +1113,14 @@ mod tests {
             assistant_display_parts("{\"tool\":\"bash\",\"command\":\"cargo check\"}");
         assert!(thinking.is_empty());
         assert_eq!(assistant, "Requested tool: bash cargo check");
+    }
+
+    #[test]
+    fn summarizes_tool_calls_in_thinking_for_display() {
+        let (thinking, assistant) =
+            assistant_display_parts("<think>{\"tool\":\"read\",\"path\":\"src/main.rs\"}</think>");
+        assert!(thinking.is_empty());
+        assert_eq!(assistant, "Requested tool: read src/main.rs");
     }
 
     #[test]
