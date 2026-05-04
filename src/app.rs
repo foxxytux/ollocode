@@ -13,6 +13,8 @@ use serde_json::Value;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
+const MAX_TOOL_ROUNDS_PER_PROMPT: usize = 6;
+
 #[derive(Debug, Clone)]
 pub struct TranscriptItem {
     pub role: String,
@@ -50,6 +52,9 @@ pub struct App {
     pub rx: mpsc::UnboundedReceiver<AppEvent>,
     messages: Vec<ChatMessage>,
     tool_specs: Vec<OllamaToolSpec>,
+    active_prompt: Option<String>,
+    tool_rounds: usize,
+    last_tool_signature: Option<String>,
     pending_assistant: String,
     response_start: Option<usize>,
     stream_role: Option<String>,
@@ -146,6 +151,9 @@ impl App {
             tools,
             models: Vec::new(),
             tool_specs: standard_tools(),
+            active_prompt: None,
+            tool_rounds: 0,
+            last_tool_signature: None,
             input: String::new(),
             input_cursor: 0,
             command_cursor: 0,
@@ -407,6 +415,9 @@ impl App {
         };
 
         self.push_transcript("user", prompt.clone());
+        self.active_prompt = Some(prompt.clone());
+        self.tool_rounds = 0;
+        self.last_tool_signature = None;
         self.messages.push(ChatMessage {
             role: "user".to_string(),
             content: prompt,
@@ -492,6 +503,38 @@ impl App {
                 self.replace_latest_assistant_with_message(&message);
 
                 if !message.tool_calls.is_empty() {
+                    let signature = tool_call_signature(&message.tool_calls);
+                    self.tool_rounds = self.tool_rounds.saturating_add(1);
+                    if self.tool_rounds > MAX_TOOL_ROUNDS_PER_PROMPT {
+                        self.busy = false;
+                        self.response_start = None;
+                        self.stream_role = None;
+                        self.status = format!(
+                            "Stopped after {} tool rounds to avoid a loop",
+                            MAX_TOOL_ROUNDS_PER_PROMPT
+                        );
+                        self.push_transcript(
+                            "system",
+                            "Stopped because the model kept requesting tools. Rephrase the request or ask for a narrower step.".to_string(),
+                        );
+                        return;
+                    }
+                    if self
+                        .last_tool_signature
+                        .as_ref()
+                        .is_some_and(|previous| previous == &signature)
+                    {
+                        self.busy = false;
+                        self.response_start = None;
+                        self.stream_role = None;
+                        self.status = "Stopped repeated tool call loop".to_string();
+                        self.push_transcript(
+                            "system",
+                            "Stopped because the model repeated the same tool call with the same arguments. Please restate the task or give a new constraint.".to_string(),
+                        );
+                        return;
+                    }
+                    self.last_tool_signature = Some(signature);
                     self.status = format!(
                         "Running {}",
                         if message.tool_calls.len() == 1 {
@@ -555,9 +598,12 @@ impl App {
                 }
                 self.save_conversation();
                 if let Some(model) = self.selected_model.clone() {
+                    self.append_working_prompt();
                     self.start_chat(model);
                 } else {
                     self.busy = false;
+                    self.response_start = None;
+                    self.stream_role = None;
                     self.status = "No model selected for tool follow-up".to_string();
                 }
             }
@@ -594,6 +640,27 @@ impl App {
         if !assistant.trim().is_empty() {
             self.push_transcript("assistant", assistant);
         }
+    }
+
+    fn append_working_prompt(&mut self) {
+        let Some(original_prompt) = self.active_prompt.clone() else {
+            return;
+        };
+
+        let reminder = format!(
+            "Original user request:\n{}\n\nYou are still working on the same task. Use the tool results above to advance the request. Do not repeat the same tool call or the same arguments. If you already have enough information, answer the user directly instead of calling another tool.",
+            original_prompt
+        );
+
+        self.messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: reminder.clone(),
+            thinking: None,
+            tool_calls: Vec::new(),
+            tool_name: None,
+        });
+        self.push_transcript("user", reminder);
+        self.save_conversation();
     }
 
     fn append_stream_delta(&mut self, role: &str, delta: String) {
@@ -637,6 +704,9 @@ impl App {
             "/clear" => {
                 self.transcript.clear();
                 self.messages.truncate(1);
+                self.active_prompt = None;
+                self.tool_rounds = 0;
+                self.last_tool_signature = None;
                 let _ = ConversationState::clear(&self.cwd);
                 self.status = "Transcript cleared".to_string();
                 return;
@@ -1072,6 +1142,21 @@ fn local_tool_call(call: &OllamaToolCall) -> anyhow::Result<ToolCall> {
         .map_err(|error| anyhow::anyhow!(error))
 }
 
+fn tool_call_signature(tool_calls: &[OllamaToolCall]) -> String {
+    serde_json::to_string(
+        &tool_calls
+            .iter()
+            .map(|call| {
+                serde_json::json!({
+                    "name": call.function.name,
+                    "arguments": call.function.arguments,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_default()
+}
+
 fn previous_boundary(text: &str, cursor: usize) -> Option<usize> {
     if cursor == 0 {
         return None;
@@ -1117,6 +1202,9 @@ mod tests {
             tx,
             rx,
             messages: vec![system_prompt(None)],
+            active_prompt: None,
+            tool_rounds: 0,
+            last_tool_signature: None,
             pending_assistant: String::new(),
             response_start: None,
             stream_role: None,

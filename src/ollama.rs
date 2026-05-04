@@ -470,6 +470,7 @@ The full conversation history in this chat is your memory. Use previous user and
 Do not output evaluation JSON, benchmark metadata, or self-critique wrappers. Reply in plain language unless you are emitting a tool response.
 Use the provided native tools when you need to inspect or change the workspace. Do not invent your own tool syntax in assistant content.
 Prefer the smallest useful tool call, and continue from tool results until the task is complete.
+When you receive a tool result, either answer the user directly or request a different tool if it adds new information. Do not repeat the same tool call with the same arguments, and do not keep calling tools once the task is already answered.
 "#
             .to_string();
             prompt.push_str(&agents_section);
